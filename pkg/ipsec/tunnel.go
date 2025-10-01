@@ -22,6 +22,7 @@ type Tunnel struct {
 	RemoteIP        string
 	LocalVirtualIP  string
 	RemoteVirtualIP string
+	GREKey          uint32 // GRE密钥
 }
 
 // 执行命令并记录
@@ -56,6 +57,20 @@ func generateSPI(ip1, ip2 string) string {
 	data := ip1 + ip2
 	hash := md5.Sum([]byte(data))
 	return hex.EncodeToString(hash[:])[:8]
+}
+
+// 生成GRE Key (从auth密钥字符串生成)
+func generateGREKey(authKey string) uint32 {
+	// 去掉0x前缀
+	authKey = strings.TrimPrefix(authKey, "0x")
+
+	// 计算所有字符的ASCII值之和
+	var sum uint32
+	for _, c := range authKey {
+		sum += uint32(c)
+	}
+
+	return sum
 }
 
 // 获取较大和较小的IP（用于保证两端生成相同的SPI）
@@ -241,16 +256,17 @@ func (t *Tunnel) Create() error {
 	// 记录撤销命令
 	revCommands := []string{
 		fmt.Sprintf("ip link set %s down", t.Name),
-		fmt.Sprintf("ip tunnel del %s mode gre remote %s local %s ttl 255", t.Name, t.RemoteIP, t.LocalIP),
+		fmt.Sprintf("ip tunnel del %s mode gre remote %s local %s key %d ttl 255", t.Name, t.RemoteIP, t.LocalIP, t.GREKey),
 		fmt.Sprintf("ip addr del %s/32 dev %s", t.LocalVirtualIP, t.Name),
-		fmt.Sprintf("ip route del %s/32 dev %s", t.RemoteVirtualIP, t.Name),
+		fmt.Sprintf("ip route del %s/32 dev %s table 80", t.RemoteVirtualIP, t.Name),
 	}
 	recordRevCommands(revFile, revCommands)
 
 	fmt.Println("创建隧道...")
 
-	// 创建GRE隧道
-	cmd := fmt.Sprintf("ip tunnel add %s mode gre remote %s local %s ttl 255", t.Name, t.RemoteIP, t.LocalIP)
+	// 创建GRE隧道 (带key参数)
+	cmd := fmt.Sprintf("ip tunnel add %s mode gre remote %s local %s key %d ttl 255",
+		t.Name, t.RemoteIP, t.LocalIP, t.GREKey)
 	if err := execCommand(cmd); err != nil {
 		return err
 	}
@@ -267,8 +283,16 @@ func (t *Tunnel) Create() error {
 		return err
 	}
 
-	// 添加路由
-	cmd = fmt.Sprintf("ip route add %s/32 dev %s", t.RemoteVirtualIP, t.Name)
+	// 确保路由规则存在 (表80用于虚拟IP路由)
+	checkCmd := exec.Command("bash", "-c", "ip rule list | grep -q ^80:")
+	if err := checkCmd.Run(); err != nil {
+		cmd = "ip rule add from all lookup 80 pref 80"
+		execCommand(cmd)
+		fmt.Println("  ✓ 添加路由规则: table 80")
+	}
+
+	// 添加路由到表80
+	cmd = fmt.Sprintf("ip route add %s/32 dev %s table 80", t.RemoteVirtualIP, t.Name)
 	if err := execCommand(cmd); err != nil {
 		return err
 	}

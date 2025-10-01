@@ -1,11 +1,13 @@
 package system
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"trueword_node/pkg/config"
+	"trueword_node/pkg/network"
 )
 
 // 检查命令是否存在
@@ -183,13 +185,76 @@ func Initialize() error {
 	}
 	fmt.Printf("  ✓ 配置文件已创建: %s\n", config.ConfigDir+"/"+config.ConfigFile)
 
+	// 7. 扫描物理网络接口
+	fmt.Println("\n扫描物理网络接口...")
+	interfaces, err := network.ScanPhysicalInterfaces()
+	if err != nil {
+		return fmt.Errorf("扫描网络接口失败: %w", err)
+	}
+
+	if len(interfaces) == 0 {
+		fmt.Println("  ⚠ 未找到可用的物理网络接口")
+	} else {
+		fmt.Printf("  找到 %d 个物理接口:\n", len(interfaces))
+
+		reader := bufio.NewReader(os.Stdin)
+		var selectedInterfaces []network.PhysicalInterface
+
+		for _, iface := range interfaces {
+			fmt.Printf("\n  接口: %s\n", iface.Name)
+			fmt.Printf("    IP地址: %s\n", iface.IP)
+			if iface.Gateway != "" {
+				fmt.Printf("    网关: %s\n", iface.Gateway)
+			} else {
+				fmt.Printf("    网关: (未检测到，可能是P2P连接)\n")
+			}
+
+			fmt.Print("    是否添加此接口? [Y/n]: ")
+			response, _ := reader.ReadString('\n')
+			response = strings.TrimSpace(strings.ToLower(response))
+
+			if response == "" || response == "y" || response == "yes" {
+				// 如果未检测到网关，询问用户
+				if iface.Gateway == "" {
+					fmt.Print("    请输入网关地址(留空表示P2P连接): ")
+					gateway, _ := reader.ReadString('\n')
+					gateway = strings.TrimSpace(gateway)
+					if gateway != "" {
+						iface.Gateway = gateway
+					}
+				}
+
+				selectedInterfaces = append(selectedInterfaces, iface)
+				fmt.Printf("    ✓ 已添加 %s\n", iface.Name)
+			} else {
+				fmt.Printf("    ✗ 跳过 %s\n", iface.Name)
+			}
+		}
+
+		if len(selectedInterfaces) == 0 {
+			fmt.Println("\n  ⚠ 未选择任何接口，将无法创建隧道")
+		} else {
+			// 保存接口配置
+			ifaceConfig := &network.InterfaceConfig{
+				Interfaces: selectedInterfaces,
+			}
+
+			if err := network.SaveInterfaceConfig(ifaceConfig); err != nil {
+				return fmt.Errorf("保存接口配置失败: %w", err)
+			}
+
+			fmt.Printf("\n  ✓ 已保存 %d 个物理接口配置\n", len(selectedInterfaces))
+		}
+	}
+
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("✓ 初始化完成!")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println("\n提示:")
-	fmt.Println("  1. 现在可以创建隧道了，每条隧道使用独立的密钥")
-	fmt.Println("  2. 配置文件位置: /etc/trueword_node/config.yaml")
-	fmt.Println("  3. iptables规则不会自动保存，重启后需要重新配置")
+	fmt.Println("  1. 物理接口配置: /etc/trueword_node/interfaces/physical.yaml")
+	fmt.Println("  2. 现在可以创建隧道了，每条隧道使用独立的密钥")
+	fmt.Println("  3. 配置文件位置: /etc/trueword_node/config.yaml")
+	fmt.Println("  4. iptables规则不会自动保存，重启后需要重新配置")
 	fmt.Println("     建议使用 iptables-save 保存规则")
 	fmt.Println()
 

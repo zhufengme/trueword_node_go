@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"trueword_node/pkg/config"
 	"trueword_node/pkg/ipsec"
+	"trueword_node/pkg/network"
 	"trueword_node/pkg/routing"
 	"trueword_node/pkg/system"
 )
@@ -44,54 +45,125 @@ func readPassword(prompt string) string {
 func interactiveCreateLine() error {
 	fmt.Println("=== 交互式创建隧道 ===\n")
 
-	// 输入远程IP
-	remoteIP := readInput("远程IP地址: ")
+	// 1. 列出可用的父接口
+	fmt.Println("正在扫描可用的父接口...")
+	parents, err := network.ListAvailableParentInterfaces()
+	if err != nil {
+		return fmt.Errorf("获取父接口失败: %w", err)
+	}
+
+	fmt.Println("\n可用的父接口:")
+	fmt.Println(strings.Repeat("-", 60))
+	for i, parent := range parents {
+		fmt.Printf("[%d] %s (%s)\n", i+1, parent.Name, parent.Type)
+		fmt.Printf("    IP: %s\n", parent.IP)
+		if parent.Gateway != "" {
+			fmt.Printf("    网关: %s\n", parent.Gateway)
+		}
+	}
+	fmt.Println(strings.Repeat("-", 60))
+
+	// 2. 选择父接口
+	var parentInterface string
+	for {
+		choice := readInput("\n选择父接口 (输入编号或名称): ")
+		if choice == "" {
+			return fmt.Errorf("必须选择父接口")
+		}
+
+		// 尝试按编号选择
+		var selectedIdx int
+		if _, err := fmt.Sscanf(choice, "%d", &selectedIdx); err == nil {
+			if selectedIdx >= 1 && selectedIdx <= len(parents) {
+				parentInterface = parents[selectedIdx-1].Name
+				break
+			}
+		}
+
+		// 尝试按名称选择
+		found := false
+		for _, parent := range parents {
+			if parent.Name == choice {
+				parentInterface = choice
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+
+		fmt.Println("无效的选择，请重新输入")
+	}
+
+	fmt.Printf("已选择父接口: %s\n", parentInterface)
+
+	// 3. 输入远程IP
+	remoteIP := readInput("\n远程IP地址: ")
 	if remoteIP == "" {
 		return fmt.Errorf("远程IP不能为空")
 	}
 
-	// 输入远程虚拟IP
+	// 4. 输入远程虚拟IP
 	remoteVIP := readInput("远程虚拟IP: ")
 	if remoteVIP == "" {
 		return fmt.Errorf("远程虚拟IP不能为空")
 	}
 
-	// 输入本地IP
-	localIP := readInput("本地IP地址: ")
-	if localIP == "" {
-		return fmt.Errorf("本地IP不能为空")
-	}
-
-	// 输入本地虚拟IP
+	// 5. 输入本地虚拟IP (注意: 不是本地IP!)
 	localVIP := readInput("本地虚拟IP: ")
 	if localVIP == "" {
 		return fmt.Errorf("本地虚拟IP不能为空")
 	}
 
-	// 输入隧道名
+	// 6. 输入隧道名
 	tunnelName := readInput("隧道名称 (留空自动生成): ")
 	if tunnelName == "" {
 		tunnelName = fmt.Sprintf("tun-%d", rand.Intn(9000)+1000)
 		fmt.Printf("自动生成隧道名: %s\n", tunnelName)
 	}
 
-	// 输入认证密钥
+	// 7. 是否使用加密
+	useEncryption := true
+	encChoice := readInput("是否使用IPsec加密? (Y/n): ")
+	if strings.ToLower(strings.TrimSpace(encChoice)) == "n" {
+		useEncryption = false
+	}
+
+	// 8. 输入认证密钥
 	authPass := readPassword("认证密钥 (不显示): ")
 	if authPass == "" {
 		return fmt.Errorf("认证密钥不能为空")
 	}
 
-	// 输入加密密钥
-	encPass := readPassword("加密密钥 (不显示): ")
-	if encPass == "" {
-		return fmt.Errorf("加密密钥不能为空")
+	// 9. 输入加密密钥
+	var encPass string
+	if useEncryption {
+		encPass = readPassword("加密密钥 (不显示): ")
+		if encPass == "" {
+			return fmt.Errorf("加密密钥不能为空")
+		}
+	} else {
+		encPass = authPass // 不加密时使用相同的密钥
 	}
 
-	// 确认信息
-	fmt.Println("\n=== 确认信息 ===")
-	fmt.Printf("远程: %s/%s\n", remoteIP, remoteVIP)
-	fmt.Printf("本地: %s/%s\n", localIP, localVIP)
-	fmt.Printf("隧道名: %s\n", tunnelName)
+	// 10. 生成密钥
+	authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
+	if err != nil {
+		return err
+	}
+
+	// 11. 确认信息
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("=== 确认信息 ===")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("父接口:      %s\n", parentInterface)
+	fmt.Printf("远程IP:      %s\n", remoteIP)
+	fmt.Printf("远程虚拟IP:  %s\n", remoteVIP)
+	fmt.Printf("本地虚拟IP:  %s\n", localVIP)
+	fmt.Printf("隧道名:      %s\n", tunnelName)
+	fmt.Printf("使用加密:    %v\n", useEncryption)
+	fmt.Println(strings.Repeat("=", 60))
 
 	confirm := readInput("\n确认创建? (yes/no): ")
 	if confirm != "yes" && confirm != "y" {
@@ -99,15 +171,24 @@ func interactiveCreateLine() error {
 		return nil
 	}
 
-	// 生成密钥
-	authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
-	if err != nil {
-		return err
+	// 12. 创建隧道配置
+	tunnelConfig := &network.TunnelConfig{
+		Name:            tunnelName,
+		ParentInterface: parentInterface,
+		LocalIP:         "", // 自动从父接口获取
+		RemoteIP:        remoteIP,
+		LocalVIP:        localVIP,
+		RemoteVIP:       remoteVIP,
+		AuthKey:         authKey,
+		EncKey:          encKey,
+		Enabled:         true,
+		UseEncryption:   useEncryption,
 	}
 
-	// 创建线路
+	// 13. 使用TunnelManager创建
 	fmt.Println("\n开始创建...")
-	return ipsec.CreateLine(remoteIP, remoteVIP, localIP, localVIP, tunnelName, authKey, encKey)
+	tm := ipsec.NewTunnelManager(tunnelConfig)
+	return tm.Create()
 }
 
 func main() {
@@ -118,6 +199,80 @@ func main() {
 		Short: "TrueWord Node - IPsec隧道管理工具",
 		Long:  `TrueWord Node 是一个用于管理GRE over IPsec隧道和策略路由的工具`,
 	}
+
+	// 接口管理命令组
+	interfaceCmd := &cobra.Command{
+		Use:   "interface",
+		Short: "管理物理网络接口",
+		Aliases: []string{"iface", "if"},
+	}
+
+	// 列出物理接口
+	interfaceListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "列出已配置的物理接口",
+		Run: func(cmd *cobra.Command, args []string) {
+			ifaceConfig, err := network.LoadInterfaceConfig()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载接口配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			if len(ifaceConfig.Interfaces) == 0 {
+				fmt.Println("未配置物理接口，请先运行: twnode init")
+				return
+			}
+
+			fmt.Println("物理网络接口:")
+			fmt.Println(strings.Repeat("=", 60))
+			for _, iface := range ifaceConfig.Interfaces {
+				status := "✓"
+				if !iface.Enabled {
+					status = "✗"
+				}
+				fmt.Printf("\n%s %s\n", status, iface.Name)
+				fmt.Printf("  IP地址: %s\n", iface.IP)
+				if iface.Gateway != "" {
+					fmt.Printf("  网关: %s\n", iface.Gateway)
+				} else {
+					fmt.Printf("  网关: (P2P连接)\n")
+				}
+				fmt.Printf("  状态: %s\n", map[bool]string{true: "已启用", false: "已禁用"}[iface.Enabled])
+			}
+			fmt.Println(strings.Repeat("=", 60))
+		},
+	}
+
+	// 扫描接口
+	interfaceScanCmd := &cobra.Command{
+		Use:   "scan",
+		Short: "重新扫描物理接口",
+		Run: func(cmd *cobra.Command, args []string) {
+			interfaces, err := network.ScanPhysicalInterfaces()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "扫描失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			if len(interfaces) == 0 {
+				fmt.Println("未找到可用的物理接口")
+				return
+			}
+
+			fmt.Printf("找到 %d 个物理接口:\n", len(interfaces))
+			for _, iface := range interfaces {
+				fmt.Printf("\n  %s\n", iface.Name)
+				fmt.Printf("    IP: %s\n", iface.IP)
+				if iface.Gateway != "" {
+					fmt.Printf("    网关: %s\n", iface.Gateway)
+				} else {
+					fmt.Printf("    网关: (未检测到)\n")
+				}
+			}
+		},
+	}
+
+	interfaceCmd.AddCommand(interfaceListCmd, interfaceScanCmd)
 
 	// 初始化命令
 	initCmd := &cobra.Command{
@@ -152,10 +307,10 @@ func main() {
 
 	// 创建线路
 	lineCreateCmd := &cobra.Command{
-		Use:   "create [remote_ip/remote_vip] [local_ip/local_vip] [tunnel_name]",
+		Use:   "create [parent_interface] [remote_ip] [remote_vip] [local_vip] [tunnel_name]",
 		Short: "创建隧道(自动创建IPsec连接和GRE隧道)",
-		Long:  "不带参数时进入交互模式\n带参数时需要指定 --auth-key 和 --enc-key",
-		Args:  cobra.RangeArgs(0, 3),
+		Long:  "不带参数时进入交互模式\n带参数格式: twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunnel_name] --auth-key <key> --enc-key <key>",
+		Args:  cobra.RangeArgs(0, 5),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 如果没有参数，进入交互模式
 			if len(args) == 0 {
@@ -166,33 +321,23 @@ func main() {
 				return
 			}
 
-			// 命令行模式：需要至少2个参数
-			if len(args) < 2 {
+			// 命令行模式：需要至少4个参数
+			if len(args) < 4 {
 				fmt.Fprintln(os.Stderr, "参数不足")
-				fmt.Fprintln(os.Stderr, "格式: twnode line create <remote_ip/remote_vip> <local_ip/local_vip> [tunnel_name]")
+				fmt.Fprintln(os.Stderr, "格式: twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunnel_name] --auth-key <key> --enc-key <key>")
 				fmt.Fprintln(os.Stderr, "或直接运行: twnode line create (进入交互模式)")
 				os.Exit(1)
 			}
 
-			// 解析参数
-			remoteParts := strings.Split(args[0], "/")
-			localParts := strings.Split(args[1], "/")
-
-			if len(remoteParts) != 2 || len(localParts) != 2 {
-				fmt.Fprintln(os.Stderr, "格式错误")
-				fmt.Fprintln(os.Stderr, "格式: twnode line create <remote_ip/remote_vip> <local_ip/local_vip> [tunnel_name]")
-				os.Exit(1)
-			}
-
-			remoteIP := remoteParts[0]
-			remoteVIP := remoteParts[1]
-			localIP := localParts[0]
-			localVIP := localParts[1]
+			parentInterface := args[0]
+			remoteIP := args[1]
+			remoteVIP := args[2]
+			localVIP := args[3]
 
 			// 隧道名
 			tunnelName := ""
-			if len(args) >= 3 {
-				tunnelName = args[2]
+			if len(args) >= 5 {
+				tunnelName = args[4]
 			} else {
 				tunnelName = fmt.Sprintf("tun-%d", rand.Intn(9000)+1000)
 				fmt.Printf("隧道名未指定，自动分配: %s\n", tunnelName)
@@ -201,11 +346,17 @@ func main() {
 			// 获取密钥
 			authPass, _ := cmd.Flags().GetString("auth-key")
 			encPass, _ := cmd.Flags().GetString("enc-key")
+			noEncrypt, _ := cmd.Flags().GetBool("no-encrypt")
 
-			if authPass == "" || encPass == "" {
-				fmt.Fprintln(os.Stderr, "错误: 命令行模式必须指定 --auth-key 和 --enc-key")
+			if authPass == "" {
+				fmt.Fprintln(os.Stderr, "错误: 命令行模式必须指定 --auth-key")
 				fmt.Fprintln(os.Stderr, "或不带参数进入交互模式: twnode line create")
 				os.Exit(1)
+			}
+
+			// 如果不加密，使用相同的密钥
+			if noEncrypt || encPass == "" {
+				encPass = authPass
 			}
 
 			// 生成密钥
@@ -215,15 +366,31 @@ func main() {
 				os.Exit(1)
 			}
 
-			// 创建线路
-			if err := ipsec.CreateLine(remoteIP, remoteVIP, localIP, localVIP, tunnelName, authKey, encKey); err != nil {
-				fmt.Fprintf(os.Stderr, "创建线路失败: %v\n", err)
+			// 创建隧道配置
+			tunnelConfig := &network.TunnelConfig{
+				Name:            tunnelName,
+				ParentInterface: parentInterface,
+				LocalIP:         "", // 自动从父接口获取
+				RemoteIP:        remoteIP,
+				LocalVIP:        localVIP,
+				RemoteVIP:       remoteVIP,
+				AuthKey:         authKey,
+				EncKey:          encKey,
+				Enabled:         true,
+				UseEncryption:   !noEncrypt,
+			}
+
+			// 使用TunnelManager创建
+			tm := ipsec.NewTunnelManager(tunnelConfig)
+			if err := tm.Create(); err != nil {
+				fmt.Fprintf(os.Stderr, "创建失败: %v\n", err)
 				os.Exit(1)
 			}
 		},
 	}
 	lineCreateCmd.Flags().String("auth-key", "", "认证密钥字符串(命令行模式必需)")
-	lineCreateCmd.Flags().String("enc-key", "", "加密密钥字符串(命令行模式必需)")
+	lineCreateCmd.Flags().String("enc-key", "", "加密密钥字符串(可选,不指定则使用auth-key)")
+	lineCreateCmd.Flags().Bool("no-encrypt", false, "不使用IPsec加密")
 
 	// 删除隧道
 	lineRemoveCmd := &cobra.Command{
@@ -578,7 +745,7 @@ func main() {
 		policyApplyCmd, policyRevokeCmd)
 
 	// 添加所有命令
-	rootCmd.AddCommand(initCmd, statusCmd, lineCmd, policyCmd)
+	rootCmd.AddCommand(initCmd, statusCmd, interfaceCmd, lineCmd, policyCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
