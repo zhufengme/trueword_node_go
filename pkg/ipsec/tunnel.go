@@ -25,9 +25,8 @@ type Tunnel struct {
 	GREKey          uint32 // GRE密钥
 }
 
-// 执行命令并记录
+// 执行命令并记录 (静默执行,只在出错时显示)
 func execCommand(cmd string) error {
-	fmt.Printf("执行: %s\n", cmd)
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return nil
@@ -36,7 +35,10 @@ func execCommand(cmd string) error {
 	command := exec.Command(parts[0], parts[1:]...)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		fmt.Printf("错误输出: %s\n", string(output))
+		// 出错时显示命令和错误输出
+		fmt.Printf("\n❌ 命令执行失败:\n")
+		fmt.Printf("   命令: %s\n", cmd)
+		fmt.Printf("   错误: %s\n", string(output))
 		return fmt.Errorf("命令执行失败: %w", err)
 	}
 	return nil
@@ -142,7 +144,7 @@ func CreateIPsec(localIP, remoteIP, authKey, encKey string) error {
 	}
 
 	if !localExists && !remoteExists {
-		return fmt.Errorf("本地或远程IP必须存在于本地接口")
+		return fmt.Errorf("❌ 本地或远程IP必须存在于本地接口")
 	}
 
 	// 确定本地和远程IP
@@ -160,16 +162,10 @@ func CreateIPsec(localIP, remoteIP, authKey, encKey string) error {
 	spiOne := generateSPI(ipOne, ipTwo)
 	spiTwo := generateSPI(ipTwo, ipOne)
 
-	fmt.Printf("生成 SPI one: 0x%s\n", spiOne)
-	fmt.Printf("生成 SPI two: 0x%s\n", spiTwo)
-	fmt.Printf("IPsec AUTH KEY: %s\n", authKey)
-	fmt.Printf("IPsec ENC KEY: %s\n", encKey)
-
 	// 撤销文件名
 	revFile := fmt.Sprintf("%s-%s.rev", ipOne, ipTwo)
 
 	// 先清理旧配置
-	fmt.Println("清理旧的 xfrm state 和 policy...")
 	executeRevCommands(revFile)
 
 	// 记录撤销命令
@@ -180,8 +176,6 @@ func CreateIPsec(localIP, remoteIP, authKey, encKey string) error {
 		fmt.Sprintf("ip xfrm state del src %s dst %s proto esp spi 0x%s", ipTwo, ipOne, spiTwo),
 	}
 	recordRevCommands(revFile, revCommands)
-
-	fmt.Println("添加 xfrm state...")
 
 	// 添加xfrm state
 	cmd := fmt.Sprintf("ip xfrm state add src %s dst %s proto esp spi 0x%s mode tunnel auth sha256 %s enc aes %s",
@@ -196,8 +190,6 @@ func CreateIPsec(localIP, remoteIP, authKey, encKey string) error {
 		return err
 	}
 
-	fmt.Println("添加 xfrm policy...")
-
 	// 添加xfrm policy
 	cmd = fmt.Sprintf("ip xfrm policy add src %s dst %s dir out ptype main tmpl src %s dst %s proto esp mode tunnel",
 		actualLocalIP, actualRemoteIP, actualLocalIP, actualRemoteIP)
@@ -211,14 +203,15 @@ func CreateIPsec(localIP, remoteIP, authKey, encKey string) error {
 		return err
 	}
 
-	fmt.Println("检查链接...")
+	fmt.Printf("   ✓ IPsec加密隧道已建立\n")
+
+	// 测试连通性
 	if pingHost(actualRemoteIP, 3) {
-		fmt.Printf("✓ IPsec 链接 %s <-> %s 已就绪\n", actualLocalIP, actualRemoteIP)
+		fmt.Printf("   ✓ 加密连接验证成功 (%s <-> %s)\n", actualLocalIP, actualRemoteIP)
 		return nil
 	} else {
-		fmt.Printf("⚠ IPsec 链接 %s <-> %s 未就绪\n", actualLocalIP, actualRemoteIP)
-		fmt.Println("本地链接已创建，但无法连接到远程对等点")
-		fmt.Printf("请确保远程对等点 %s 也运行了相同的命令\n", actualRemoteIP)
+		fmt.Printf("   ⚠️  加密隧道已建立但未连接\n")
+		fmt.Printf("      等待远程节点 %s 建立连接...\n", actualRemoteIP)
 		return nil
 	}
 }
@@ -228,28 +221,21 @@ func RemoveIPsec(ip1, ip2 string) error {
 	ipOne, ipTwo := sortIPs(ip1, ip2)
 	revFile := fmt.Sprintf("%s-%s.rev", ipOne, ipTwo)
 
-	fmt.Println("删除 IPsec 连接...")
 	if err := executeRevCommands(revFile); err != nil {
-		return fmt.Errorf("删除失败: %w", err)
+		return fmt.Errorf("❌ 删除IPsec连接失败: %w", err)
 	}
 
-	fmt.Println("完成")
 	return nil
 }
 
 // 创建GRE隧道
 func (t *Tunnel) Create() error {
-	fmt.Println("检查远程IP可达性...")
-	if !pingHost(t.RemoteIP, 3) {
-		fmt.Println("⚠ 远程IP地址不可达，连接可能失败")
-	}
-
 	// 检查接口是否已存在
 	if interfaceExists(t.Name) {
-		return fmt.Errorf("接口 %s 已存在", t.Name)
+		return fmt.Errorf("❌ 接口 %s 已存在", t.Name)
 	}
 
-	// 撤销文件
+	// 清理旧配置
 	revFile := fmt.Sprintf("%s.rev", t.Name)
 	executeRevCommands(revFile)
 
@@ -261,8 +247,6 @@ func (t *Tunnel) Create() error {
 		fmt.Sprintf("ip route del %s/32 dev %s table 80", t.RemoteVirtualIP, t.Name),
 	}
 	recordRevCommands(revFile, revCommands)
-
-	fmt.Println("创建隧道...")
 
 	// 创建GRE隧道 (带key参数)
 	cmd := fmt.Sprintf("ip tunnel add %s mode gre remote %s local %s key %d ttl 255",
@@ -287,8 +271,9 @@ func (t *Tunnel) Create() error {
 	checkCmd := exec.Command("bash", "-c", "ip rule list | grep -q ^80:")
 	if err := checkCmd.Run(); err != nil {
 		cmd = "ip rule add from all lookup 80 pref 80"
-		execCommand(cmd)
-		fmt.Println("  ✓ 添加路由规则: table 80")
+		if err := execCommand(cmd); err != nil {
+			return err
+		}
 	}
 
 	// 添加路由到表80
@@ -297,16 +282,15 @@ func (t *Tunnel) Create() error {
 		return err
 	}
 
-	fmt.Println("检查连接...")
+	fmt.Printf("   ✓ GRE隧道已创建\n")
+
+	// 测试连通性
 	if pingHost(t.RemoteVirtualIP, 3) {
-		fmt.Printf("✓ 隧道 %s <-> (%s) <-> %s <-> (%s) <-> %s 已就绪\n",
-			t.LocalVirtualIP, t.LocalIP, t.Name, t.RemoteIP, t.RemoteVirtualIP)
+		fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", t.LocalVirtualIP, t.RemoteVirtualIP)
 		return nil
 	} else {
-		fmt.Printf("⚠ 隧道 %s <-> (%s) <-> %s <-> (%s) <-> %s 未就绪\n",
-			t.LocalVirtualIP, t.LocalIP, t.Name, t.RemoteIP, t.RemoteVirtualIP)
-		fmt.Println("本地链接已创建，但无法连接到远程对等点")
-		fmt.Printf("请确保远程对等点 %s 也运行了创建隧道命令\n", t.RemoteIP)
+		fmt.Printf("   ⚠️  隧道已创建但未连接\n")
+		fmt.Printf("      等待远程节点 %s 建立连接...\n", t.RemoteIP)
 		return nil
 	}
 }
@@ -315,12 +299,11 @@ func (t *Tunnel) Create() error {
 func RemoveTunnel(tunnelName string) error {
 	revFile := fmt.Sprintf("%s.rev", tunnelName)
 
-	fmt.Println("删除 GRE 隧道...")
 	if err := executeRevCommands(revFile); err != nil {
-		return fmt.Errorf("删除失败: %w", err)
+		return fmt.Errorf("❌ 删除失败: %w", err)
 	}
 
-	fmt.Println("完成")
+	fmt.Printf("✓ 隧道 %s 已删除\n", tunnelName)
 	return nil
 }
 

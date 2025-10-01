@@ -3,7 +3,6 @@ package ipsec
 import (
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"trueword_node/pkg/network"
@@ -77,6 +76,7 @@ func setupPolicyRoute(remoteIP, parentInterface, gateway string) error {
 	iface := ifaceConfig.GetInterfaceByName(parentInterface)
 	if iface == nil {
 		// 不是物理接口,可能是上级隧道,不需要设置策略路由
+		fmt.Printf("   ✓ 策略路由: 跳过 (父接口为隧道)\n")
 		return nil
 	}
 
@@ -105,7 +105,6 @@ func setupPolicyRoute(remoteIP, parentInterface, gateway string) error {
 		if err := netlink.RuleAdd(rule); err != nil {
 			return fmt.Errorf("添加路由规则失败: %w", err)
 		}
-		fmt.Printf("  ✓ 添加路由规则: table %d\n", routeTable)
 	}
 
 	// 获取父接口
@@ -143,9 +142,9 @@ func setupPolicyRoute(remoteIP, parentInterface, gateway string) error {
 	}
 
 	if gateway != "" {
-		fmt.Printf("  ✓ 策略路由: %s via %s dev %s table %d\n", remoteIP, gateway, parentInterface, routeTable)
+		fmt.Printf("   ✓ 策略路由: %s -> %s (via %s)\n", remoteIP, parentInterface, gateway)
 	} else {
-		fmt.Printf("  ✓ 策略路由: %s dev %s table %d (P2P)\n", remoteIP, parentInterface, routeTable)
+		fmt.Printf("   ✓ 策略路由: %s -> %s (P2P)\n", remoteIP, parentInterface)
 	}
 
 	return nil
@@ -182,14 +181,17 @@ func removePolicyRoute(remoteIP, parentInterface string) error {
 func (tm *TunnelManager) Create() error {
 	cfg := tm.config
 
-	fmt.Printf("创建隧道: %s\n", cfg.Name)
-	fmt.Println(strings.Repeat("=", 60))
+	// 显示创建信息
+	fmt.Println()
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Printf("║  创建隧道: %-48s║\n", cfg.Name)
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
 
 	// 1. 验证父接口
 	if err := network.ValidateParentInterface(cfg.ParentInterface); err != nil {
-		return fmt.Errorf("父接口验证失败: %w", err)
+		return fmt.Errorf("❌ 父接口验证失败: %w", err)
 	}
-	fmt.Printf("  ✓ 父接口: %s\n", cfg.ParentInterface)
 
 	// 2. 如果未指定本地IP,从父接口获取
 	if cfg.LocalIP == "" {
@@ -199,36 +201,44 @@ func (tm *TunnelManager) Create() error {
 		}
 		cfg.LocalIP = localIP
 	}
-	fmt.Printf("  ✓ 本地IP: %s\n", cfg.LocalIP)
 
 	// 3. 获取网关(用于策略路由)
 	gateway, _ := getGatewayFromParent(cfg.ParentInterface)
+
+	// 显示配置信息
+	fmt.Println("【配置信息】")
+	fmt.Printf("  父接口:     %s\n", cfg.ParentInterface)
+	fmt.Printf("  本地IP:     %s (自动获取)\n", cfg.LocalIP)
 	if gateway != "" {
-		fmt.Printf("  ✓ 网关: %s\n", gateway)
+		fmt.Printf("  网关:       %s\n", gateway)
 	}
+	fmt.Printf("  远程IP:     %s\n", cfg.RemoteIP)
+	fmt.Printf("  本地VIP:    %s\n", cfg.LocalVIP)
+	fmt.Printf("  远程VIP:    %s\n", cfg.RemoteVIP)
+	if cfg.UseEncryption {
+		fmt.Printf("  加密:       已启用 (IPsec ESP)\n")
+	} else {
+		fmt.Printf("  加密:       未启用\n")
+	}
+	fmt.Println()
 
 	// 4. 设置策略路由(确保远程IP通过正确的物理接口)
-	fmt.Println("\n设置策略路由...")
+	fmt.Println("【建立连接】")
 	if err := setupPolicyRoute(cfg.RemoteIP, cfg.ParentInterface, gateway); err != nil {
-		return fmt.Errorf("设置策略路由失败: %w", err)
+		return fmt.Errorf("❌ 设置策略路由失败: %w", err)
 	}
 
 	// 5. 创建IPsec连接(如果启用加密)
 	if cfg.UseEncryption {
-		fmt.Println("\n创建IPsec连接...")
 		if err := CreateIPsec(cfg.LocalIP, cfg.RemoteIP, cfg.AuthKey, cfg.EncKey); err != nil {
 			removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
-			return fmt.Errorf("创建IPsec失败: %w", err)
+			return fmt.Errorf("❌ 创建IPsec失败: %w", err)
 		}
 		time.Sleep(time.Second)
 	}
 
 	// 6. 创建GRE隧道
-	fmt.Println("\n创建GRE隧道...")
-
-	// 生成GRE Key (从auth密钥生成)
 	greKey := generateGREKey(cfg.AuthKey)
-
 	tunnel := &Tunnel{
 		Name:            cfg.Name,
 		LocalIP:         cfg.LocalIP,
@@ -244,19 +254,22 @@ func (tm *TunnelManager) Create() error {
 			RemoveIPsec(cfg.LocalIP, cfg.RemoteIP)
 		}
 		removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
-		return fmt.Errorf("创建GRE隧道失败: %w", err)
+		return fmt.Errorf("❌ 创建GRE隧道失败: %w", err)
 	}
 
 	// 7. 保存配置
 	if err := network.SaveTunnelConfig(cfg); err != nil {
-		fmt.Printf("  ⚠ 保存配置失败: %v\n", err)
+		fmt.Printf("   ⚠️  配置保存失败: %v\n", err)
 	} else {
-		fmt.Printf("  ✓ 配置已保存\n")
+		fmt.Printf("   ✓ 配置已保存\n")
 	}
 
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Printf("✓ 隧道 %s 创建成功!\n", cfg.Name)
-	fmt.Println(strings.Repeat("=", 60))
+	// 成功提示
+	fmt.Println()
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Printf("║  ✓ 隧道 %-49s 创建成功! ║\n", cfg.Name)
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
 
 	return nil
 }
@@ -265,31 +278,36 @@ func (tm *TunnelManager) Create() error {
 func (tm *TunnelManager) Remove() error {
 	cfg := tm.config
 
-	fmt.Printf("删除隧道: %s\n", cfg.Name)
+	fmt.Println()
+	fmt.Printf("正在删除隧道: %s\n", cfg.Name)
 
 	// 1. 删除GRE隧道
 	if err := RemoveTunnel(cfg.Name); err != nil {
-		fmt.Printf("  ⚠ 删除GRE隧道失败: %v\n", err)
+		fmt.Printf("   ⚠️  删除GRE隧道失败: %v\n", err)
 	}
 
 	// 2. 删除IPsec连接(如果启用了加密)
 	if cfg.UseEncryption {
 		if err := RemoveIPsec(cfg.LocalIP, cfg.RemoteIP); err != nil {
-			fmt.Printf("  ⚠ 删除IPsec失败: %v\n", err)
+			fmt.Printf("   ⚠️  删除IPsec失败: %v\n", err)
 		}
 	}
 
 	// 3. 删除策略路由
 	if err := removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface); err != nil {
-		fmt.Printf("  ⚠ 删除策略路由失败: %v\n", err)
+		fmt.Printf("   ⚠️  删除策略路由失败: %v\n", err)
 	}
 
 	// 4. 删除配置文件
 	if err := network.DeleteTunnelConfig(cfg.Name); err != nil {
-		fmt.Printf("  ⚠ 删除配置文件失败: %v\n", err)
+		fmt.Printf("   ⚠️  删除配置文件失败: %v\n", err)
+	} else {
+		fmt.Printf("   ✓ 配置文件已删除\n")
 	}
 
-	fmt.Printf("✓ 隧道 %s 已删除\n", cfg.Name)
+	fmt.Println()
+	fmt.Printf("✓ 隧道 %s 删除完成\n", cfg.Name)
+	fmt.Println()
 	return nil
 }
 
