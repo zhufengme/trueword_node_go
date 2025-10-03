@@ -14,16 +14,16 @@ const (
 
 // TunnelConfig 隧道配置
 type TunnelConfig struct {
-	Name            string `yaml:"name"`              // 隧道名称
-	ParentInterface string `yaml:"parent_interface"`  // 父接口(物理接口名或上级隧道名)
-	LocalIP         string `yaml:"local_ip"`          // 本地IP (物理接口IP或上级隧道VIP)
-	RemoteIP        string `yaml:"remote_ip"`         // 远程IP
-	LocalVIP        string `yaml:"local_vip"`         // 本地虚拟IP
-	RemoteVIP       string `yaml:"remote_vip"`        // 远程虚拟IP
-	AuthKey         string `yaml:"auth_key"`          // 认证密钥
-	EncKey          string `yaml:"enc_key"`           // 加密密钥
-	Enabled         bool   `yaml:"enabled"`           // 是否启用
-	UseEncryption   bool   `yaml:"use_encryption"`    // 是否使用IPsec加密
+	Name            string `yaml:"name"`             // 隧道名称
+	ParentInterface string `yaml:"parent_interface"` // 父接口(物理接口名或上级隧道名)
+	LocalIP         string `yaml:"local_ip"`         // 本地IP (物理接口IP或上级隧道VIP)
+	RemoteIP        string `yaml:"remote_ip"`        // 远程IP
+	LocalVIP        string `yaml:"local_vip"`        // 本地虚拟IP
+	RemoteVIP       string `yaml:"remote_vip"`       // 远程虚拟IP
+	AuthKey         string `yaml:"auth_key"`         // 认证密钥
+	EncKey          string `yaml:"enc_key"`          // 加密密钥
+	Enabled         bool   `yaml:"enabled"`          // 是否启用
+	UseEncryption   bool   `yaml:"use_encryption"`   // 是否使用IPsec加密
 }
 
 // SaveTunnelConfig 保存隧道配置

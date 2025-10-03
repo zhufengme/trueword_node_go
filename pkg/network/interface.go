@@ -17,10 +17,10 @@ const (
 
 // PhysicalInterface 物理网络接口
 type PhysicalInterface struct {
-	Name    string `yaml:"name"`     // 接口名 (如 eth0, ens33)
-	IP      string `yaml:"ip"`       // IP地址
-	Gateway string `yaml:"gateway"`  // 网关地址
-	Enabled bool   `yaml:"enabled"`  // 是否启用
+	Name    string `yaml:"name"`    // 接口名 (如 eth0, ens33)
+	IP      string `yaml:"ip"`      // IP地址
+	Gateway string `yaml:"gateway"` // 网关地址
+	Enabled bool   `yaml:"enabled"` // 是否启用
 }
 
 // InterfaceConfig 所有物理接口配置
@@ -51,7 +51,7 @@ func ScanPhysicalInterfaces() ([]PhysicalInterface, error) {
 		if linkType != "device" && linkType != "tun" && linkType != "bond" {
 			// 允许普通设备和bond接口
 			if attrs.Name != "eth0" && attrs.Name != "ens" &&
-			   !isPhysicalInterface(attrs.Name) {
+				!isPhysicalInterface(attrs.Name) {
 				continue
 			}
 		}

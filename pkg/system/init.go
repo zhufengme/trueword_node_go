@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/jedib0t/go-pretty/v6/table"
 	"trueword_node/pkg/config"
 	"trueword_node/pkg/network"
 )
@@ -330,76 +332,219 @@ func Initialize() error {
 
 // ShowStatus 显示系统状态
 func ShowStatus() error {
-	fmt.Println("系统状态:")
-	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println()
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Println("║                    TrueWord Node 状态                      ║")
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	// 加载检查结果
+	checkResults, err := network.LoadCheckResults()
+	if err != nil {
+		checkResults = &network.AllCheckResults{
+			Results: make(map[string]*network.CheckResult),
+		}
+	}
+
+	// 加载配置获取默认路由设置
+	cfg, _ := config.Load()
+	defaultExit := ""
+	if cfg != nil {
+		defaultExit = cfg.Routing.DefaultExit
+	}
+
+	// 显示出口状态表格（包括物理接口和隧道）
+	fmt.Println("【出口状态】")
+	fmt.Println()
+
+	// 创建表格
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.AppendHeader(table.Row{"接口名", "类型", "启用状态", "运行状态", "延迟(ms)", "丢包率", "目标IP"})
+	t.SetStyle(table.StyleLight)
+
+	// 1. 添加物理接口
+	ifaceConfig, err := network.LoadInterfaceConfig()
+	if err == nil && len(ifaceConfig.Interfaces) > 0 {
+		for _, iface := range ifaceConfig.Interfaces {
+			enabledStatus := "启用"
+			if !iface.Enabled {
+				enabledStatus = "禁用"
+			}
+
+			// 检查是否是默认路由出口
+			interfaceName := iface.Name
+			if defaultExit != "" && iface.Name == defaultExit {
+				interfaceName = iface.Name + " *"
+			}
+
+			// 从检查结果获取状态
+			result, ok := checkResults.Results[iface.Name]
+			var runStatus, latency, packetLoss, targetIP string
+
+			if !ok || result == nil {
+				runStatus = "未检查"
+				latency = "-"
+				packetLoss = "-"
+				targetIP = "-"
+			} else {
+				switch result.Status {
+				case "UP":
+					runStatus = "UP"
+					latency = fmt.Sprintf("%.2f", result.Latency)
+					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
+					targetIP = result.TargetIP
+				case "DOWN":
+					runStatus = "DOWN"
+					latency = fmt.Sprintf("%.2f", result.Latency)
+					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
+					targetIP = result.TargetIP
+				case "IDLE":
+					runStatus = "IDLE"
+					latency = "-"
+					packetLoss = "-"
+					targetIP = "-"
+				default:
+					runStatus = "未知"
+					latency = "-"
+					packetLoss = "-"
+					targetIP = "-"
+				}
+			}
+
+			t.AppendRow(table.Row{
+				interfaceName,
+				"物理接口",
+				enabledStatus,
+				runStatus,
+				latency,
+				packetLoss,
+				targetIP,
+			})
+		}
+	}
+
+	// 2. 添加隧道
+	tunnelDir := config.ConfigDir + "/tunnels"
+	entries, err := os.ReadDir(tunnelDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".yaml") {
+				continue
+			}
+
+			tunnelName := strings.TrimSuffix(entry.Name(), ".yaml")
+
+			// 加载隧道配置获取启用状态
+			tunnelConfig, _ := network.LoadTunnelConfig(tunnelName)
+			enabledStatus := "禁用"
+			if tunnelConfig != nil && tunnelConfig.Enabled {
+				enabledStatus = "启用"
+			}
+
+			// 检查是否是默认路由出口
+			tunnelDisplayName := tunnelName
+			if defaultExit != "" && tunnelName == defaultExit {
+				tunnelDisplayName = tunnelName + " *"
+			}
+
+			result, ok := checkResults.Results[tunnelName]
+			var runStatus, latency, packetLoss, targetIP string
+
+			if !ok || result == nil {
+				runStatus = "未检查"
+				latency = "-"
+				packetLoss = "-"
+				targetIP = "-"
+			} else {
+				switch result.Status {
+				case "UP":
+					runStatus = "UP"
+					latency = fmt.Sprintf("%.2f", result.Latency)
+					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
+					targetIP = result.TargetIP
+				case "DOWN":
+					runStatus = "DOWN"
+					latency = fmt.Sprintf("%.2f", result.Latency)
+					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
+					targetIP = result.TargetIP
+				case "IDLE":
+					runStatus = "IDLE"
+					latency = "-"
+					packetLoss = "-"
+					targetIP = "-"
+				default:
+					runStatus = "未知"
+					latency = "-"
+					packetLoss = "-"
+					targetIP = "-"
+				}
+			}
+
+			t.AppendRow(table.Row{
+				tunnelDisplayName,
+				"隧道",
+				enabledStatus,
+				runStatus,
+				latency,
+				packetLoss,
+				targetIP,
+			})
+		}
+	}
+
+	// 渲染表格
+	t.Render()
+
+	// 如果设置了默认路由，显示说明
+	if defaultExit != "" {
+		fmt.Println()
+		fmt.Printf("  * 默认路由出口: %s\n", defaultExit)
+	}
+	fmt.Println()
+
+	// 显示最后检查时间
+	if !checkResults.LastUpdate.IsZero() {
+		fmt.Printf("  最后检查时间: %s\n", checkResults.LastUpdate.Format("2006-01-02 15:04:05"))
+	} else {
+		fmt.Printf("  提示: 运行 'twnode line check <ip>' 来检查出口连通性\n")
+	}
+
+	// 系统配置
+	fmt.Println()
+	fmt.Println("【系统配置】")
+	fmt.Println()
 
 	// IP转发
 	ipForward, _ := checkSysctl("net.ipv4.ip_forward")
-	fmt.Printf("\nIP转发: %s\n", map[string]string{"1": "已启用 ✓", "0": "未启用 ✗"}[ipForward])
+	fmt.Printf("  IP转发:             %s\n", map[string]string{"1": "✓ 已启用", "0": "✗ 未启用"}[ipForward])
 
 	// iptables MASQUERADE
 	masqueradeExists := iptablesRuleExists("nat", "POSTROUTING", "-j MASQUERADE")
-	fmt.Printf("iptables MASQUERADE: %s\n", map[bool]string{true: "已配置 ✓", false: "未配置 ✗"}[masqueradeExists])
+	fmt.Printf("  iptables MASQ:      %s\n", map[bool]string{true: "✓ 已配置", false: "✗ 未配置"}[masqueradeExists])
 
-	// 隧道列表
-	fmt.Println("\n活动隧道:")
-	cmd := exec.Command("ip", "tunnel", "show")
+	// 策略路由数量
+	cmd := exec.Command("ip", "rule", "list")
 	output, err := cmd.Output()
-	if err == nil {
-		lines := strings.Split(string(output), "\n")
-		count := 0
-		for _, line := range lines {
-			if line != "" && !strings.Contains(line, "remote any") {
-				parts := strings.Split(line, ":")
-				if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-					fmt.Printf("  - %s\n", strings.TrimSpace(line))
-					count++
-				}
-			}
-		}
-		if count == 0 {
-			fmt.Println("  无")
-		}
-	}
-
-	// XFRM状态
-	fmt.Println("\nIPsec连接:")
-	cmd = exec.Command("ip", "xfrm", "state", "list")
-	output, err = cmd.Output()
-	if err == nil && len(output) > 0 {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "src") {
-				fmt.Printf("  %s\n", line)
-			}
-		}
-	} else {
-		fmt.Println("  无")
-	}
-
-	// 策略路由规则
-	fmt.Println("\n策略路由规则:")
-	cmd = exec.Command("ip", "rule", "list")
-	output, err = cmd.Output()
+	policyCount := 0
 	if err == nil {
 		lines := strings.Split(string(output), "\n")
 		for _, line := range lines {
-			if line != "" {
-				// 只显示我们管理的规则（优先级10-999）
-				if strings.Contains(line, "lookup") {
-					parts := strings.Fields(line)
-					if len(parts) > 0 {
-						prio := strings.TrimSuffix(parts[0], ":")
-						// 简单检查是否在我们的范围内
-						if prio != "0" && prio != "32766" && prio != "32767" {
-							fmt.Printf("  %s\n", line)
-						}
+			if line != "" && strings.Contains(line, "lookup") {
+				parts := strings.Fields(line)
+				if len(parts) > 0 {
+					prio := strings.TrimSuffix(parts[0], ":")
+					if prio != "0" && prio != "32766" && prio != "32767" {
+						policyCount++
 					}
 				}
 			}
 		}
 	}
+	fmt.Printf("  策略路由规则:       %d 条\n", policyCount)
 
-	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println()
+	fmt.Println(strings.Repeat("=", 80))
+
 	return nil
 }

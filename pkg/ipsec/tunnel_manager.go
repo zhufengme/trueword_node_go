@@ -334,3 +334,90 @@ func (tm *TunnelManager) Restart() error {
 	// 再创建
 	return tm.Create()
 }
+
+// Start 启动隧道(仅创建IPsec连接和GRE隧道，不重新配置)
+func (tm *TunnelManager) Start() error {
+	cfg := tm.config
+
+	fmt.Printf("  启动隧道: %s ... ", cfg.Name)
+
+	// 检查隧道是否已存在
+	if _, err := netlink.LinkByName(cfg.Name); err == nil {
+		fmt.Printf("已运行\n")
+		return nil
+	}
+
+	// 1. 设置策略路由
+	gateway, _ := getGatewayFromParent(cfg.ParentInterface)
+	if err := setupPolicyRoute(cfg.RemoteIP, cfg.ParentInterface, gateway); err != nil {
+		fmt.Printf("失败 (策略路由错误)\n")
+		return err
+	}
+
+	// 2. 创建IPsec连接(如果启用加密)
+	if cfg.UseEncryption {
+		if err := CreateIPsec(cfg.LocalIP, cfg.RemoteIP, cfg.AuthKey, cfg.EncKey); err != nil {
+			removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+			fmt.Printf("失败 (IPsec错误)\n")
+			return err
+		}
+	}
+
+	// 3. 创建GRE隧道
+	greKey := generateGREKey(cfg.AuthKey)
+	tunnel := &Tunnel{
+		Name:            cfg.Name,
+		LocalIP:         cfg.LocalIP,
+		RemoteIP:        cfg.RemoteIP,
+		LocalVirtualIP:  cfg.LocalVIP,
+		RemoteVirtualIP: cfg.RemoteVIP,
+		GREKey:          greKey,
+	}
+
+	if err := tunnel.Create(); err != nil {
+		// 失败时清理
+		if cfg.UseEncryption {
+			RemoveIPsec(cfg.LocalIP, cfg.RemoteIP)
+		}
+		removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+		fmt.Printf("失败 (GRE错误)\n")
+		return err
+	}
+
+	fmt.Printf("✓\n")
+	return nil
+}
+
+// Stop 停止隧道(删除IPsec连接和GRE隧道，保留配置)
+func (tm *TunnelManager) Stop() error {
+	cfg := tm.config
+
+	fmt.Printf("  停止隧道: %s ... ", cfg.Name)
+
+	// 检查隧道是否存在
+	if _, err := netlink.LinkByName(cfg.Name); err != nil {
+		fmt.Printf("未运行\n")
+		return nil
+	}
+
+	// 1. 删除GRE隧道 (直接执行撤销命令，避免重复输出)
+	revFile := fmt.Sprintf("%s.rev", cfg.Name)
+	if err := executeRevCommands(revFile); err != nil {
+		fmt.Printf("失败 (GRE错误)\n")
+		return err
+	}
+
+	// 2. 删除IPsec连接(如果启用了加密)
+	if cfg.UseEncryption {
+		if err := RemoveIPsec(cfg.LocalIP, cfg.RemoteIP); err != nil {
+			fmt.Printf("失败 (IPsec错误)\n")
+			return err
+		}
+	}
+
+	// 3. 删除策略路由
+	removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+
+	fmt.Printf("✓\n")
+	return nil
+}

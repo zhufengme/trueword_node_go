@@ -202,8 +202,8 @@ func main() {
 
 	// 接口管理命令组
 	interfaceCmd := &cobra.Command{
-		Use:   "interface",
-		Short: "管理物理网络接口",
+		Use:     "interface",
+		Short:   "管理物理网络接口",
 		Aliases: []string{"iface", "if"},
 	}
 
@@ -405,7 +405,219 @@ func main() {
 		},
 	}
 
-	lineCmd.AddCommand(lineCreateCmd, lineRemoveCmd)
+	// 启动单个隧道
+	lineStartCmd := &cobra.Command{
+		Use:   "start <tunnel_name>",
+		Short: "启动隧道",
+		Long:  "启动指定的隧道，建立IPsec和GRE连接",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 启动隧道
+			tm := ipsec.NewTunnelManager(tunnelConfig)
+			if err := tm.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println()
+			fmt.Printf("✓ 隧道 %s 启动成功\n", tunnelName)
+		},
+	}
+
+	// 停止单个隧道
+	lineStopCmd := &cobra.Command{
+		Use:   "stop <tunnel_name>",
+		Short: "停止隧道",
+		Long:  "停止指定的隧道，保留配置，隧道进入IDLE状态",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 停止隧道
+			tm := ipsec.NewTunnelManager(tunnelConfig)
+			if err := tm.Stop(); err != nil {
+				fmt.Fprintf(os.Stderr, "停止失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println()
+			fmt.Printf("✓ 隧道 %s 已停止\n", tunnelName)
+		},
+	}
+
+	// 启用隧道
+	lineEnableCmd := &cobra.Command{
+		Use:   "enable <tunnel_name>",
+		Short: "启用隧道",
+		Long:  "启用隧道，使其包含在start-all操作中。如果隧道未启动则启动",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 如果已经启用，直接返回
+			if tunnelConfig.Enabled {
+				fmt.Printf("隧道 %s 已经是启用状态\n", tunnelName)
+
+				// 检查是否已启动，未启动则启动
+				if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", tunnelName)); os.IsNotExist(err) {
+					fmt.Printf("隧道未启动，正在启动...\n")
+					tm := ipsec.NewTunnelManager(tunnelConfig)
+					if err := tm.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("✓ 隧道 %s 启动成功\n", tunnelName)
+				}
+				return
+			}
+
+			// 设置为启用
+			tunnelConfig.Enabled = true
+			if err := network.SaveTunnelConfig(tunnelConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("✓ 隧道 %s 已启用\n", tunnelName)
+
+			// 启动隧道
+			fmt.Printf("正在启动隧道...\n")
+			tm := ipsec.NewTunnelManager(tunnelConfig)
+			if err := tm.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✓ 隧道 %s 启动成功\n", tunnelName)
+		},
+	}
+
+	// 禁用隧道
+	lineDisableCmd := &cobra.Command{
+		Use:   "disable <tunnel_name>",
+		Short: "禁用隧道",
+		Long:  "禁用隧道，使其不包含在start-all操作中。如果隧道正在运行则停止",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 如果已经禁用，直接返回
+			if !tunnelConfig.Enabled {
+				fmt.Printf("隧道 %s 已经是禁用状态\n", tunnelName)
+
+				// 检查是否在运行，运行中则停止
+				if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", tunnelName)); err == nil {
+					fmt.Printf("隧道正在运行，正在停止...\n")
+					tm := ipsec.NewTunnelManager(tunnelConfig)
+					if err := tm.Stop(); err != nil {
+						fmt.Fprintf(os.Stderr, "停止失败: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("✓ 隧道 %s 已停止\n", tunnelName)
+				}
+				return
+			}
+
+			// 设置为禁用
+			tunnelConfig.Enabled = false
+			if err := network.SaveTunnelConfig(tunnelConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("✓ 隧道 %s 已禁用\n", tunnelName)
+
+			// 停止隧道
+			fmt.Printf("正在停止隧道...\n")
+			tm := ipsec.NewTunnelManager(tunnelConfig)
+			if err := tm.Stop(); err != nil {
+				fmt.Fprintf(os.Stderr, "停止失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✓ 隧道 %s 已停止\n", tunnelName)
+		},
+	}
+
+	// 检查隧道
+	lineCheckCmd := &cobra.Command{
+		Use:   "check <ip1>[,ip2,ip3...]",
+		Short: "检查所有隧道的连通性",
+		Long:  "依次ping指定的IP地址，成功则返回。结果保存到缓存文件供status命令使用。",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 解析IP列表
+			targetIPs := strings.Split(args[0], ",")
+			for i, ip := range targetIPs {
+				targetIPs[i] = strings.TrimSpace(ip)
+			}
+
+			if len(targetIPs) == 0 {
+				fmt.Fprintln(os.Stderr, "错误: 必须指定至少一个目标IP")
+				os.Exit(1)
+			}
+
+			if err := network.CheckAllTunnels(targetIPs); err != nil {
+				fmt.Fprintf(os.Stderr, "检查失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// 启动所有隧道
+	lineStartAllCmd := &cobra.Command{
+		Use:   "start-all",
+		Short: "启动所有隧道",
+		Long:  "批量启动所有已配置的隧道(仅限启用的隧道)",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := ipsec.StartAllTunnels(); err != nil {
+				fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// 停止所有隧道
+	lineStopAllCmd := &cobra.Command{
+		Use:   "stop-all",
+		Short: "停止所有隧道",
+		Long:  "批量停止所有已配置的隧道(保留配置，仅停止虚拟隧道)",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := ipsec.StopAllTunnels(); err != nil {
+				fmt.Fprintf(os.Stderr, "停止失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	lineCmd.AddCommand(lineCreateCmd, lineRemoveCmd, lineStartCmd, lineStopCmd,
+		lineEnableCmd, lineDisableCmd, lineCheckCmd, lineStartAllCmd, lineStopAllCmd)
 
 	// 策略路由命令组
 	policyCmd := &cobra.Command{
@@ -417,7 +629,7 @@ func main() {
 	policyCreateCmd := &cobra.Command{
 		Use:   "create <group_name> <exit_interface>",
 		Short: "创建策略组",
-		Long:  "创建策略组，优先级自动分配。同一CIDR只能属于一个策略组",
+		Long:  "创建策略组，优先级自动分配。出口可以是物理接口、隧道或第三方接口(OpenVPN/WireGuard等)",
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			pm = routing.NewPolicyManager()
@@ -542,7 +754,7 @@ func main() {
 	policyDefaultCmd := &cobra.Command{
 		Use:   "default <exit_interface>",
 		Short: "设置/切换默认路由(0.0.0.0/0)出口",
-		Long:  "设置策略路由的默认路由(0.0.0.0/0)，作为兜底路由\n设置后自动应用到内核\n不设置则使用系统默认路由表",
+		Long:  "设置策略路由的默认路由(0.0.0.0/0)，作为兜底路由\n设置后自动应用到内核（不影响其他策略组）\n不设置则使用系统默认路由表",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 加载配置
@@ -562,36 +774,17 @@ func main() {
 			}
 
 			if oldExit == "" {
-				fmt.Printf("默认路由(0.0.0.0/0): (未设置) -> %s\n", args[0])
+				fmt.Printf("默认路由(0.0.0.0/0): (未设置) -> %s\n\n", args[0])
 			} else {
-				fmt.Printf("默认路由(0.0.0.0/0): %s -> %s\n", oldExit, args[0])
+				fmt.Printf("默认路由(0.0.0.0/0): %s -> %s\n\n", oldExit, args[0])
 			}
 
-			// 应用策略
+			// 只应用默认路由（不重新应用所有策略组）
 			pm = routing.NewPolicyManager()
-
-			// 加载所有策略组
-			entries, err := os.ReadDir(routing.PolicyDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "读取策略目录失败: %v\n", err)
-				os.Exit(1)
-			}
-
-			for _, entry := range entries {
-				if strings.HasSuffix(entry.Name(), ".policy") {
-					groupName := strings.TrimSuffix(entry.Name(), ".policy")
-					if err := pm.LoadGroup(groupName); err != nil {
-						fmt.Fprintf(os.Stderr, "加载策略组 %s 失败: %v\n", groupName, err)
-					}
-				}
-			}
-
-			// 设置新的默认路由
 			pm.SetDefaultExit(cfg.Routing.DefaultExit)
 
-			// 应用
-			if err := pm.Apply(); err != nil {
-				fmt.Fprintf(os.Stderr, "应用策略失败: %v\n", err)
+			if err := pm.ApplyDefaultRouteOnly(); err != nil {
+				fmt.Fprintf(os.Stderr, "应用默认路由失败: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -603,7 +796,7 @@ func main() {
 	policyUnsetDefaultCmd := &cobra.Command{
 		Use:   "unset-default",
 		Short: "清除默认路由设置",
-		Long:  "清除默认路由(0.0.0.0/0)设置，使用系统默认路由表\n清除后自动应用到内核",
+		Long:  "清除默认路由(0.0.0.0/0)设置，使用系统默认路由表\n清除后自动撤销内核中的默认路由（不影响其他策略组）",
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg, err := config.Load()
 			if err != nil {
@@ -624,33 +817,13 @@ func main() {
 				os.Exit(1)
 			}
 
-			fmt.Printf("默认路由(0.0.0.0/0): %s -> (未设置)\n", oldExit)
+			fmt.Printf("默认路由(0.0.0.0/0): %s -> (未设置)\n\n", oldExit)
 
-			// 应用策略
+			// 只撤销默认路由（不影响其他策略组）
 			pm = routing.NewPolicyManager()
 
-			// 加载所有策略组
-			entries, err := os.ReadDir(routing.PolicyDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "读取策略目录失败: %v\n", err)
-				os.Exit(1)
-			}
-
-			for _, entry := range entries {
-				if strings.HasSuffix(entry.Name(), ".policy") {
-					groupName := strings.TrimSuffix(entry.Name(), ".policy")
-					if err := pm.LoadGroup(groupName); err != nil {
-						fmt.Fprintf(os.Stderr, "加载策略组 %s 失败: %v\n", groupName, err)
-					}
-				}
-			}
-
-			// 清除默认路由
-			pm.SetDefaultExit(cfg.Routing.DefaultExit)
-
-			// 应用
-			if err := pm.Apply(); err != nil {
-				fmt.Fprintf(os.Stderr, "应用策略失败: %v\n", err)
+			if err := pm.RevokeDefaultRouteOnly(); err != nil {
+				fmt.Fprintf(os.Stderr, "撤销默认路由失败: %v\n", err)
 				os.Exit(1)
 			}
 

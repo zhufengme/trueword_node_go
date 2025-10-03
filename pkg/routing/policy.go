@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"trueword_node/pkg/network"
 )
 
 const (
@@ -53,6 +55,14 @@ func (pm *PolicyManager) CreateGroup(name, exit string, priority int) error {
 	if priority < PrioUserPolicyBase || priority >= PrioDefault {
 		return fmt.Errorf("优先级必须在 %d-%d 之间", PrioUserPolicyBase, PrioDefault-1)
 	}
+
+	// 验证出口接口（允许物理接口、隧道、第三方接口，但不允许loopback）
+	info, err := network.ValidateExitInterface(exit)
+	if err != nil {
+		return fmt.Errorf("出口接口验证失败: %w", err)
+	}
+
+	fmt.Printf("✓ 出口接口 %s 类型: %s, 状态: UP\n", exit, info.Type.String())
 
 	pm.groups[name] = &PolicyGroup{
 		Name:     name,
@@ -183,18 +193,44 @@ func (pm *PolicyManager) Apply() error {
 
 	// 1. 检查所有出口是否有效
 	fmt.Println("\n检查出口状态...")
+	validGroups := make(map[string]*PolicyGroup)
 	for _, group := range pm.groups {
-		if err := pm.checkExitValid(group.Exit); err != nil {
-			return fmt.Errorf("策略组 %s: %w", group.Name, err)
+		// 使用新的接口验证函数
+		if !network.IsInterfaceUp(group.Exit) {
+			fmt.Printf("  ✗ %s: 接口 %s 不存在或未启动，跳过此策略组\n", group.Name, group.Exit)
+			continue
 		}
-		fmt.Printf("  ✓ %s: 接口 %s 正常\n", group.Name, group.Exit)
+
+		// 检测接口类型
+		info, err := network.GetInterfaceInfo(group.Exit)
+		if err != nil {
+			fmt.Printf("  ✗ %s: 无法获取接口 %s 信息，跳过此策略组\n", group.Name, group.Exit)
+			continue
+		}
+
+		// 拒绝loopback
+		if info.Type == network.InterfaceTypeLoopback {
+			fmt.Printf("  ✗ %s: 接口 %s 是回环接口，跳过此策略组\n", group.Name, group.Exit)
+			continue
+		}
+
+		fmt.Printf("  ✓ %s: 接口 %s 正常 (类型: %s)\n", group.Name, group.Exit, info.Type.String())
+		validGroups[group.Name] = group
 	}
 
 	if pm.defaultExit != "" {
-		if err := pm.checkExitValid(pm.defaultExit); err != nil {
-			return fmt.Errorf("默认出口: %w", err)
+		if !network.IsInterfaceUp(pm.defaultExit) {
+			fmt.Printf("  ⚠ 默认出口: 接口 %s 不存在或未启动，将跳过默认路由设置\n", pm.defaultExit)
+			pm.defaultExit = "" // 清空，跳过后续默认路由应用
+		} else {
+			info, err := network.GetInterfaceInfo(pm.defaultExit)
+			if err != nil || info.Type == network.InterfaceTypeLoopback {
+				fmt.Printf("  ⚠ 默认出口: 接口 %s 不可用或是回环接口，将跳过默认路由设置\n", pm.defaultExit)
+				pm.defaultExit = ""
+			} else {
+				fmt.Printf("  ✓ 默认出口: 接口 %s 正常 (类型: %s)\n", pm.defaultExit, info.Type.String())
+			}
 		}
-		fmt.Printf("  ✓ 默认出口: 接口 %s 正常\n", pm.defaultExit)
 	}
 
 	// 2. 获取所有隧道，为它们设置保护路由
@@ -208,6 +244,10 @@ func (pm *PolicyManager) Apply() error {
 				continue
 			}
 
+			// 先删除旧的保护路由（如果存在）
+			delCmd := fmt.Sprintf("ip rule del to %s lookup main pref %d", remoteIP, PrioSystem)
+			execIPCommandNoError(delCmd)
+
 			// 添加规则：到远程IP的流量不走策略路由
 			// 这确保隧道底层连接不会被策略路由影响
 			cmd := fmt.Sprintf("ip rule add to %s lookup main pref %d", remoteIP, PrioSystem)
@@ -219,18 +259,17 @@ func (pm *PolicyManager) Apply() error {
 		}
 	}
 
-	// 3. 创建路由表并添加策略
-	fmt.Println("\n应用策略组...")
-	for _, group := range pm.groups {
+	// 3. 创建路由表并添加策略（仅应用有效的策略组）
+	for _, group := range validGroups {
 		if err := pm.applyGroup(group); err != nil {
-			return fmt.Errorf("应用策略组 %s 失败: %w", group.Name, err)
+			fmt.Printf("\n  ⚠ 应用策略组 %s 失败: %v，跳过\n", group.Name, err)
+			continue
 		}
 		pm.appliedGroups = append(pm.appliedGroups, group.Name)
 	}
 
 	// 4. 应用默认路由(0.0.0.0/0)
 	if pm.defaultExit != "" {
-		fmt.Println("\n应用默认路由(0.0.0.0/0)...")
 		if err := pm.applyDefaultRoute(); err != nil {
 			return fmt.Errorf("应用默认路由失败: %w", err)
 		}
@@ -250,48 +289,114 @@ func (pm *PolicyManager) Apply() error {
 func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
 	tableID := group.Priority
 
+	fmt.Printf("\n应用策略组: %s\n", group.Name)
+	fmt.Printf("  出口接口: %s\n", group.Exit)
+	fmt.Printf("  优先级: %d\n", group.Priority)
+
 	// 清空路由表
 	cmd := fmt.Sprintf("ip route flush table %d", tableID)
 	execIPCommand(cmd)
 
-	// 判断是隧道还是物理接口
-	isTunnel := strings.HasPrefix(group.Exit, "tun")
+	// 获取接口信息以决定路由命令
+	info, err := network.GetInterfaceInfo(group.Exit)
+	if err != nil {
+		return fmt.Errorf("无法获取接口信息: %w", err)
+	}
 
 	// 添加路由到表
+	successCount := 0
 	for _, cidr := range group.CIDRs {
 		var cmd string
-		if isTunnel {
-			// 隧道使用 dev
-			cmd = fmt.Sprintf("ip route add %s dev %s table %d", cidr, group.Exit, tableID)
-		} else {
-			// 物理接口需要通过网关
-			gateway, err := getInterfaceGateway(group.Exit)
-			if err != nil || gateway == "" {
-				// 如果没有网关，直接使用dev
-				cmd = fmt.Sprintf("ip route add %s dev %s table %d", cidr, group.Exit, tableID)
-			} else {
+
+		// 根据接口类型决定路由命令
+		if info.Type == network.InterfaceTypePhysical && info.Gateway != "" {
+			// 物理接口有网关：通过网关路由
+			cmd = fmt.Sprintf("ip route add %s via %s dev %s table %d", cidr, info.Gateway, group.Exit, tableID)
+		} else if info.Type == network.InterfaceTypeThirdParty {
+			// 第三方接口：尝试获取网关
+			gateway := network.GetGatewayFromRoutes(group.Exit)
+			if gateway != "" {
 				cmd = fmt.Sprintf("ip route add %s via %s dev %s table %d", cidr, gateway, group.Exit, tableID)
+			} else {
+				// 无网关，直接通过设备
+				cmd = fmt.Sprintf("ip route add %s dev %s table %d", cidr, group.Exit, tableID)
 			}
+		} else {
+			// 隧道或无网关的P2P连接：直接通过设备
+			cmd = fmt.Sprintf("ip route add %s dev %s table %d", cidr, group.Exit, tableID)
 		}
 
 		if err := execIPCommand(cmd); err != nil {
-			fmt.Printf("  ⚠ 警告: 添加路由 %s 失败: %v\n", cidr, err)
+			fmt.Printf("  ✗ IP: %s, 出口: %s - 失败\n", cidr, group.Exit)
+			fmt.Printf("     错误: %v\n", err)
+			fmt.Printf("     命令: %s\n", cmd)
+		} else {
+			fmt.Printf("  ✓ IP: %s, 出口: %s\n", cidr, group.Exit)
+			successCount++
 		}
 	}
 
-	// 删除旧的规则（如果存在）
-	cmd = fmt.Sprintf("ip rule del lookup %d", tableID)
+	// 删除旧的规则（如果存在）- 使用 pref 精确删除
+	cmd = fmt.Sprintf("ip rule del pref %d", group.Priority)
 	execIPCommandNoError(cmd)
 
 	// 添加策略规则
 	cmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, group.Priority)
 	if err := execIPCommand(cmd); err != nil {
+		fmt.Printf("  ✗ 添加策略规则失败\n")
+		fmt.Printf("     错误: %v\n", err)
+		fmt.Printf("     命令: %s\n", cmd)
 		return err
 	}
 
-	fmt.Printf("  ✓ %s: %d个CIDR -> %s (优先级 %d)\n",
-		group.Name, len(group.CIDRs), group.Exit, group.Priority)
+	fmt.Printf("  ✓ 策略组应用完成: 成功 %d/%d 个CIDR\n", successCount, len(group.CIDRs))
 
+	return nil
+}
+
+// ApplyDefaultRouteOnly 只应用默认路由（不影响其他策略组）
+func (pm *PolicyManager) ApplyDefaultRouteOnly() error {
+	if pm.defaultExit == "" {
+		return fmt.Errorf("未设置默认路由出口")
+	}
+
+	fmt.Println("应用默认路由...")
+
+	// 验证接口
+	if !network.IsInterfaceUp(pm.defaultExit) {
+		return fmt.Errorf("接口 %s 不存在或未启动", pm.defaultExit)
+	}
+
+	info, err := network.GetInterfaceInfo(pm.defaultExit)
+	if err != nil {
+		return fmt.Errorf("无法获取接口信息: %w", err)
+	}
+
+	if info.Type == network.InterfaceTypeLoopback {
+		return fmt.Errorf("不能使用回环接口作为默认路由出口")
+	}
+
+	fmt.Printf("  出口接口: %s (类型: %s)\n", pm.defaultExit, info.Type.String())
+
+	return pm.applyDefaultRoute()
+}
+
+// RevokeDefaultRouteOnly 只撤销默认路由（不影响其他策略组）
+func (pm *PolicyManager) RevokeDefaultRouteOnly() error {
+	fmt.Println("撤销默认路由...")
+
+	// 删除规则 - 使用 pref 精确删除
+	cmd := fmt.Sprintf("ip rule del pref %d", PrioDefault)
+	execIPCommandNoError(cmd)
+
+	// 清空路由表
+	cmd = fmt.Sprintf("ip route flush table %d", PrioDefault)
+	execIPCommandNoError(cmd)
+
+	// 刷新缓存
+	exec.Command("ip", "route", "flush", "cache").Run()
+
+	fmt.Printf("  ✓ 默认路由已撤销\n")
 	return nil
 }
 
@@ -299,41 +404,61 @@ func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
 func (pm *PolicyManager) applyDefaultRoute() error {
 	tableID := PrioDefault
 
+	fmt.Printf("\n应用默认路由\n")
+	fmt.Printf("  IP: 0.0.0.0/0\n")
+	fmt.Printf("  出口接口: %s\n", pm.defaultExit)
+	fmt.Printf("  优先级: %d\n", PrioDefault)
+
 	// 清空路由表
 	cmd := fmt.Sprintf("ip route flush table %d", tableID)
 	execIPCommand(cmd)
 
-	// 判断是隧道还是物理接口
-	isTunnel := strings.HasPrefix(pm.defaultExit, "tun")
+	// 获取接口信息以决定路由命令
+	info, err := network.GetInterfaceInfo(pm.defaultExit)
+	if err != nil {
+		return fmt.Errorf("无法获取接口信息: %w", err)
+	}
 
 	// 添加 0.0.0.0/0 路由
 	var routeCmd string
-	if isTunnel {
-		routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 dev %s table %d", pm.defaultExit, tableID)
-	} else {
-		gateway, err := getInterfaceGateway(pm.defaultExit)
-		if err != nil || gateway == "" {
-			routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 dev %s table %d", pm.defaultExit, tableID)
-		} else {
+	if info.Type == network.InterfaceTypePhysical && info.Gateway != "" {
+		// 物理接口有网关：通过网关路由
+		routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 via %s dev %s table %d", info.Gateway, pm.defaultExit, tableID)
+	} else if info.Type == network.InterfaceTypeThirdParty {
+		// 第三方接口：尝试获取网关
+		gateway := network.GetGatewayFromRoutes(pm.defaultExit)
+		if gateway != "" {
 			routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 via %s dev %s table %d", gateway, pm.defaultExit, tableID)
+		} else {
+			// 无网关，直接通过设备
+			routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 dev %s table %d", pm.defaultExit, tableID)
 		}
+	} else {
+		// 隧道或无网关的P2P连接：直接通过设备
+		routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 dev %s table %d", pm.defaultExit, tableID)
 	}
 
 	if err := execIPCommand(routeCmd); err != nil {
+		fmt.Printf("  ✗ 添加默认路由失败\n")
+		fmt.Printf("     错误: %v\n", err)
+		fmt.Printf("     命令: %s\n", routeCmd)
 		return err
 	}
 
-	// 删除旧的规则
-	cmd = fmt.Sprintf("ip rule del lookup %d", tableID)
+	// 删除旧的规则 - 使用 pref 精确删除
+	cmd = fmt.Sprintf("ip rule del pref %d", PrioDefault)
 	execIPCommandNoError(cmd)
 
 	// 添加规则
 	cmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, PrioDefault)
 	if err := execIPCommand(cmd); err != nil {
+		fmt.Printf("  ✗ 添加策略规则失败\n")
+		fmt.Printf("     错误: %v\n", err)
+		fmt.Printf("     命令: %s\n", cmd)
 		return err
 	}
 
-	fmt.Printf("  ✓ 默认路由(0.0.0.0/0) -> %s (优先级 %d)\n", pm.defaultExit, PrioDefault)
+	fmt.Printf("  ✓ 默认路由应用完成\n")
 	return nil
 }
 
@@ -355,8 +480,8 @@ func (pm *PolicyManager) Revoke() error {
 	for _, group := range pm.groups {
 		tableID := group.Priority
 
-		// 删除规则
-		cmd := fmt.Sprintf("ip rule del lookup %d", tableID)
+		// 删除规则 - 使用 pref 精确删除
+		cmd := fmt.Sprintf("ip rule del pref %d", group.Priority)
 		execIPCommandNoError(cmd)
 
 		// 清空路由表
@@ -368,7 +493,8 @@ func (pm *PolicyManager) Revoke() error {
 
 	// 3. 删除默认路由
 	if pm.defaultExit != "" {
-		cmd := fmt.Sprintf("ip rule del lookup %d", PrioDefault)
+		// 删除规则 - 使用 pref 精确删除
+		cmd := fmt.Sprintf("ip rule del pref %d", PrioDefault)
 		execIPCommandNoError(cmd)
 
 		cmd = fmt.Sprintf("ip route flush table %d", PrioDefault)
