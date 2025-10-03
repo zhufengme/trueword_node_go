@@ -88,12 +88,50 @@ func (pm *PolicyManager) CreateGroup(name, exit string, priority int, from strin
 }
 
 // 删除策略组
-func (pm *PolicyManager) DeleteGroup(name string) error {
-	if _, exists := pm.groups[name]; !exists {
-		return fmt.Errorf("策略组 %s 不存在", name)
+func (pm *PolicyManager) DeleteGroup(groupName string) error {
+	// 检查策略组是否存在
+	group := pm.groups[groupName]
+	if group == nil {
+		// 尝试加载
+		if err := pm.LoadGroup(groupName); err != nil {
+			return fmt.Errorf("策略组 %s 不存在", groupName)
+		}
+		group = pm.groups[groupName]
 	}
 
-	delete(pm.groups, name)
+	fmt.Printf("删除策略组: %s\n", groupName)
+
+	// 检查策略是否已应用（通过检查内核中的规则）
+	checkCmd := fmt.Sprintf("ip rule show pref %d", group.Priority)
+	output, err := exec.Command("sh", "-c", checkCmd).CombinedOutput()
+
+	isApplied := err == nil && len(output) > 0 && strings.Contains(string(output), fmt.Sprintf("%d:", group.Priority))
+
+	if isApplied {
+		fmt.Printf("  策略组已应用，先撤销...\n")
+		if err := pm.RevokeGroup(groupName); err != nil {
+			return fmt.Errorf("撤销策略组失败: %w", err)
+		}
+	} else {
+		fmt.Printf("  策略组未应用，直接删除配置\n")
+	}
+
+	// 删除配置文件
+	filePath := filepath.Join(PolicyDir, groupName+".policy")
+	if err := os.Remove(filePath); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("  ⚠ 配置文件不存在: %s\n", filePath)
+		} else {
+			return fmt.Errorf("删除配置文件失败: %w", err)
+		}
+	} else {
+		fmt.Printf("  ✓ 配置文件已删除\n")
+	}
+
+	// 从内存中移除
+	delete(pm.groups, groupName)
+
+	fmt.Printf("✓ 策略组 %s 删除完成\n", groupName)
 	return nil
 }
 
@@ -279,7 +317,7 @@ func (pm *PolicyManager) Apply() error {
 
 	// 3. 创建路由表并添加策略（仅应用有效的策略组）
 	for _, group := range validGroups {
-		if err := pm.applyGroup(group); err != nil {
+		if err := pm.ApplyGroup(group); err != nil {
 			fmt.Printf("\n  ⚠ 应用策略组 %s 失败: %v，跳过\n", group.Name, err)
 			continue
 		}
@@ -303,8 +341,8 @@ func (pm *PolicyManager) Apply() error {
 	return nil
 }
 
-// 应用单个策略组
-func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
+// ApplyGroup 应用单个策略组
+func (pm *PolicyManager) ApplyGroup(group *PolicyGroup) error {
 	tableID := group.Priority
 
 	fmt.Printf("\n应用策略组: %s\n", group.Name)
@@ -354,11 +392,7 @@ func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
 		}
 	}
 
-	// 删除旧的规则（如果存在）- 使用 pref 精确删除
-	cmd = fmt.Sprintf("ip rule del pref %d", group.Priority)
-	execIPCommandNoError(cmd)
-
-	// 添加策略规则（根据from字段）
+	// 策略规则管理：先添加新规则，再清理重复规则（避免中断）
 	var ruleCmd string
 	if group.From == "" || group.From == "all" {
 		ruleCmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, group.Priority)
@@ -366,11 +400,44 @@ func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
 		ruleCmd = fmt.Sprintf("ip rule add from %s lookup %d pref %d", group.From, tableID, group.Priority)
 	}
 
+	// 添加新规则
 	if err := execIPCommand(ruleCmd); err != nil {
-		fmt.Printf("  ✗ 添加策略规则失败\n")
-		fmt.Printf("     错误: %v\n", err)
-		fmt.Printf("     命令: %s\n", ruleCmd)
-		return err
+		// 添加失败，可能是规则已存在，这是正常的，不报错
+		// 但我们需要确保规则确实存在
+	}
+
+	// 清理重复规则：删除除了最后一个之外的所有相同优先级规则
+	// 使用循环删除，直到只剩一个
+	delCmd := fmt.Sprintf("ip rule del pref %d", group.Priority)
+	for i := 0; i < 10; i++ { // 最多尝试10次，避免无限循环
+		// 检查是否有多个相同优先级的规则
+		checkCmd := fmt.Sprintf("ip rule show pref %d | wc -l", group.Priority)
+		output, err := exec.Command("sh", "-c", checkCmd).Output()
+		if err != nil {
+			break
+		}
+
+		count := strings.TrimSpace(string(output))
+		if count == "1" || count == "0" {
+			// 只有一个或没有，停止删除
+			break
+		}
+
+		// 有多个，删除一个
+		execIPCommandNoError(delCmd)
+	}
+
+	// 最后验证规则是否存在
+	checkCmd := fmt.Sprintf("ip rule show pref %d", group.Priority)
+	output, err := exec.Command("sh", "-c", checkCmd).Output()
+	if err != nil || len(output) == 0 {
+		// 规则不存在，重新添加
+		if err := execIPCommand(ruleCmd); err != nil {
+			fmt.Printf("  ✗ 添加策略规则失败\n")
+			fmt.Printf("     错误: %v\n", err)
+			fmt.Printf("     命令: %s\n", ruleCmd)
+			return err
+		}
 	}
 
 	fmt.Printf("  ✓ 策略组应用完成: 成功 %d/%d 个CIDR\n", successCount, len(group.CIDRs))
@@ -469,17 +536,42 @@ func (pm *PolicyManager) applyDefaultRoute() error {
 		return err
 	}
 
-	// 删除旧的规则 - 使用 pref 精确删除
-	cmd = fmt.Sprintf("ip rule del pref %d", PrioDefault)
-	execIPCommandNoError(cmd)
-
-	// 添加规则
+	// 策略规则管理：先添加新规则，再清理重复规则（避免中断）
 	cmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, PrioDefault)
+
+	// 添加新规则
 	if err := execIPCommand(cmd); err != nil {
-		fmt.Printf("  ✗ 添加策略规则失败\n")
-		fmt.Printf("     错误: %v\n", err)
-		fmt.Printf("     命令: %s\n", cmd)
-		return err
+		// 添加失败，可能是规则已存在，这是正常的
+	}
+
+	// 清理重复规则：删除除了最后一个之外的所有相同优先级规则
+	delCmd := fmt.Sprintf("ip rule del pref %d", PrioDefault)
+	for i := 0; i < 10; i++ {
+		checkCmd := fmt.Sprintf("ip rule show pref %d | wc -l", PrioDefault)
+		output, err := exec.Command("sh", "-c", checkCmd).Output()
+		if err != nil {
+			break
+		}
+
+		count := strings.TrimSpace(string(output))
+		if count == "1" || count == "0" {
+			break
+		}
+
+		execIPCommandNoError(delCmd)
+	}
+
+	// 最后验证规则是否存在
+	checkCmd := fmt.Sprintf("ip rule show pref %d", PrioDefault)
+	output, err := exec.Command("sh", "-c", checkCmd).Output()
+	if err != nil || len(output) == 0 {
+		// 规则不存在，重新添加
+		if err := execIPCommand(cmd); err != nil {
+			fmt.Printf("  ✗ 添加策略规则失败\n")
+			fmt.Printf("     错误: %v\n", err)
+			fmt.Printf("     命令: %s\n", cmd)
+			return err
+		}
 	}
 
 	fmt.Printf("  ✓ 默认路由应用完成\n")
@@ -532,6 +624,32 @@ func (pm *PolicyManager) Revoke() error {
 
 	pm.appliedGroups = make([]string, 0)
 	fmt.Println("✓ 策略路由撤销完成")
+	return nil
+}
+
+// RevokeGroup 撤销单个策略组
+func (pm *PolicyManager) RevokeGroup(groupName string) error {
+	group := pm.groups[groupName]
+	if group == nil {
+		return fmt.Errorf("策略组 %s 不存在", groupName)
+	}
+
+	fmt.Printf("撤销策略组: %s\n", groupName)
+
+	tableID := group.Priority
+
+	// 删除规则 - 使用 pref 精确删除
+	cmd := fmt.Sprintf("ip rule del pref %d", group.Priority)
+	execIPCommandNoError(cmd)
+
+	// 清空路由表
+	cmd = fmt.Sprintf("ip route flush table %d", tableID)
+	execIPCommandNoError(cmd)
+
+	// 刷新缓存
+	exec.Command("ip", "route", "flush", "cache").Run()
+
+	fmt.Printf("  ✓ 策略组 %s 已撤销\n", groupName)
 	return nil
 }
 
@@ -938,7 +1056,7 @@ func printScores(scores []*ExitScore, bestExit *ExitScore) {
 func (pm *PolicyManager) FailoverGroup(groupName string, candidates []string, checkIP string) error {
 	fmt.Printf("准备 failover: %s -> 候选出口 [%s]\n\n", groupName, strings.Join(candidates, ", "))
 
-	// 验证策略组是否存在
+	// 只加载指定的策略组
 	if err := pm.LoadGroup(groupName); err != nil {
 		return fmt.Errorf("策略组 %s 不存在", groupName)
 	}
@@ -1006,13 +1124,16 @@ func (pm *PolicyManager) FailoverGroup(groupName string, candidates []string, ch
 	fmt.Printf("  ✓ 出口已更改为 %s\n", bestExit.Name)
 	fmt.Printf("  ✓ 配置已保存\n")
 
-	// 重新应用策略
-	if err := pm.Apply(); err != nil {
+	// 只应用当前策略组（不影响其他策略和默认路由）
+	if err := pm.ApplyGroup(group); err != nil {
 		return fmt.Errorf("应用策略失败: %w", err)
 	}
-	fmt.Printf("  ✓ 策略已应用\n\n")
+	fmt.Printf("  ✓ 策略已应用\n")
 
-	fmt.Println("\033[92mFailover 完成！\033[0m")
+	// 刷新路由缓存
+	exec.Command("ip", "route", "flush", "cache").Run()
+
+	fmt.Println("\n\033[92mFailover 完成！\033[0m")
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -840,11 +841,66 @@ func main() {
 
 	// 应用策略
 	policyApplyCmd := &cobra.Command{
-		Use:   "apply",
+		Use:   "apply [group_name]",
 		Short: "应用策略路由到内核",
+		Long: "应用所有策略路由或指定的策略组\n" +
+			"示例:\n" +
+			"  twnode policy apply           # 应用所有策略组和默认路由\n" +
+			"  twnode policy apply vpn_group # 只应用指定的策略组",
+		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			pm = routing.NewPolicyManager()
 
+			// 如果指定了策略组名称，只应用该策略组
+			if len(args) == 1 {
+				groupName := args[0]
+
+				// 加载指定的策略组
+				if err := pm.LoadGroup(groupName); err != nil {
+					fmt.Fprintf(os.Stderr, "加载策略组 %s 失败: %v\n", groupName, err)
+					os.Exit(1)
+				}
+
+				group := pm.GetGroup(groupName)
+				if group == nil {
+					fmt.Fprintf(os.Stderr, "策略组 %s 不存在\n", groupName)
+					os.Exit(1)
+				}
+
+				// 验证出口接口
+				if !network.IsInterfaceUp(group.Exit) {
+					fmt.Fprintf(os.Stderr, "出口接口 %s 不存在或未启动\n", group.Exit)
+					os.Exit(1)
+				}
+
+				info, err := network.GetInterfaceInfo(group.Exit)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "无法获取接口 %s 信息: %v\n", group.Exit, err)
+					os.Exit(1)
+				}
+
+				if info.Type == network.InterfaceTypeLoopback {
+					fmt.Fprintf(os.Stderr, "不能使用回环接口作为出口\n")
+					os.Exit(1)
+				}
+
+				fmt.Printf("应用策略组: %s\n", groupName)
+
+				// 只应用该策略组
+				if err := pm.ApplyGroup(group); err != nil {
+					fmt.Fprintf(os.Stderr, "应用策略组失败: %v\n", err)
+					os.Exit(1)
+				}
+
+				// 刷新路由缓存
+				fmt.Println("\n刷新路由缓存...")
+				exec.Command("ip", "route", "flush", "cache").Run()
+
+				fmt.Println("\n✓ 策略组应用完成")
+				return
+			}
+
+			// 否则应用所有策略组
 			// 加载配置
 			cfg, err := config.Load()
 			if err != nil {
@@ -883,11 +939,37 @@ func main() {
 
 	// 撤销策略
 	policyRevokeCmd := &cobra.Command{
-		Use:   "revoke",
-		Short: "撤销所有策略路由",
+		Use:   "revoke [group_name]",
+		Short: "撤销策略路由",
+		Long: "撤销所有策略路由或指定的策略组\n" +
+			"示例:\n" +
+			"  twnode policy revoke           # 撤销所有策略组和默认路由\n" +
+			"  twnode policy revoke vpn_group # 只撤销指定的策略组",
+		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			pm = routing.NewPolicyManager()
 
+			// 如果指定了策略组名称，只撤销该策略组
+			if len(args) == 1 {
+				groupName := args[0]
+
+				// 加载指定的策略组
+				if err := pm.LoadGroup(groupName); err != nil {
+					fmt.Fprintf(os.Stderr, "加载策略组 %s 失败: %v\n", groupName, err)
+					os.Exit(1)
+				}
+
+				// 撤销指定的策略组
+				if err := pm.RevokeGroup(groupName); err != nil {
+					fmt.Fprintf(os.Stderr, "撤销策略组失败: %v\n", err)
+					os.Exit(1)
+				}
+
+				fmt.Println("\n✓ 策略组撤销完成")
+				return
+			}
+
+			// 否则撤销所有策略
 			// 加载配置
 			cfg, err := config.Load()
 			if err != nil {
@@ -988,9 +1070,29 @@ func main() {
 		},
 	}
 
+	// 删除策略组命令
+	policyDeleteCmd := &cobra.Command{
+		Use:   "delete <group_name>",
+		Short: "删除指定的策略组",
+		Long: "删除策略组配置文件，如果策略已应用则先自动撤销\n" +
+			"示例: twnode policy delete vpn_group",
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			groupName := args[0]
+
+			pm := routing.NewPolicyManager()
+
+			// 删除策略组
+			if err := pm.DeleteGroup(groupName); err != nil {
+				fmt.Fprintf(os.Stderr, "删除策略组失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
-		policyApplyCmd, policyRevokeCmd, policyFailoverCmd)
+		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policyDeleteCmd)
 
 	// 添加所有命令
 	rootCmd.AddCommand(initCmd, statusCmd, interfaceCmd, lineCmd, policyCmd)
