@@ -629,10 +629,13 @@ func main() {
 	policyCreateCmd := &cobra.Command{
 		Use:   "create <group_name> <exit_interface>",
 		Short: "创建策略组",
-		Long:  "创建策略组，优先级自动分配。出口可以是物理接口、隧道或第三方接口(OpenVPN/WireGuard等)",
+		Long:  "创建策略组，优先级自动分配。出口可以是物理接口、隧道或第三方接口(OpenVPN/WireGuard等)\n可选参数 --from 指定源地址限制（接口名/CIDR/IP，默认all）",
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			pm = routing.NewPolicyManager()
+
+			// 获取 --from 参数
+			fromInput, _ := cmd.Flags().GetString("from")
 
 			// 加载现有策略组,找到最大优先级
 			maxPrio := routing.PrioUserPolicyBase - 1
@@ -659,7 +662,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			if err := pm.CreateGroup(args[0], args[1], newPrio); err != nil {
+			if err := pm.CreateGroup(args[0], args[1], newPrio, fromInput); err != nil {
 				fmt.Fprintf(os.Stderr, "创建策略组失败: %v\n", err)
 				os.Exit(1)
 			}
@@ -672,6 +675,9 @@ func main() {
 			fmt.Printf("✓ 策略组 %s 创建成功 (优先级: %d, 出口: %s)\n", args[0], newPrio, args[1])
 		},
 	}
+
+	// 添加 --from 标志
+	policyCreateCmd.Flags().String("from", "all", "源地址/源地址段/源接口名（默认all表示所有源）")
 
 	// 添加CIDR
 	policyAddCmd := &cobra.Command{

@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/jedib0t/go-pretty/v6/table"
 	"trueword_node/pkg/config"
 	"trueword_node/pkg/network"
 )
@@ -353,154 +352,18 @@ func ShowStatus() error {
 		defaultExit = cfg.Routing.DefaultExit
 	}
 
-	// 显示出口状态表格（包括物理接口和隧道）
-	fmt.Println("【出口状态】")
+	// 构建并显示接口树
+	roots, err := BuildInterfaceTree(checkResults, defaultExit)
+	if err != nil {
+		return fmt.Errorf("构建接口树失败: %w", err)
+	}
+
+	PrintInterfaceTree(roots)
+
+	// 图例说明
 	fmt.Println()
-
-	// 创建表格
-	t := table.NewWriter()
-	t.SetOutputMirror(os.Stdout)
-	t.AppendHeader(table.Row{"接口名", "类型", "启用状态", "运行状态", "延迟(ms)", "丢包率", "目标IP"})
-	t.SetStyle(table.StyleLight)
-
-	// 1. 添加物理接口
-	ifaceConfig, err := network.LoadInterfaceConfig()
-	if err == nil && len(ifaceConfig.Interfaces) > 0 {
-		for _, iface := range ifaceConfig.Interfaces {
-			enabledStatus := "启用"
-			if !iface.Enabled {
-				enabledStatus = "禁用"
-			}
-
-			// 检查是否是默认路由出口
-			interfaceName := iface.Name
-			if defaultExit != "" && iface.Name == defaultExit {
-				interfaceName = iface.Name + " *"
-			}
-
-			// 从检查结果获取状态
-			result, ok := checkResults.Results[iface.Name]
-			var runStatus, latency, packetLoss, targetIP string
-
-			if !ok || result == nil {
-				runStatus = "未检查"
-				latency = "-"
-				packetLoss = "-"
-				targetIP = "-"
-			} else {
-				switch result.Status {
-				case "UP":
-					runStatus = "UP"
-					latency = fmt.Sprintf("%.2f", result.Latency)
-					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
-					targetIP = result.TargetIP
-				case "DOWN":
-					runStatus = "DOWN"
-					latency = fmt.Sprintf("%.2f", result.Latency)
-					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
-					targetIP = result.TargetIP
-				case "IDLE":
-					runStatus = "IDLE"
-					latency = "-"
-					packetLoss = "-"
-					targetIP = "-"
-				default:
-					runStatus = "未知"
-					latency = "-"
-					packetLoss = "-"
-					targetIP = "-"
-				}
-			}
-
-			t.AppendRow(table.Row{
-				interfaceName,
-				"物理接口",
-				enabledStatus,
-				runStatus,
-				latency,
-				packetLoss,
-				targetIP,
-			})
-		}
-	}
-
-	// 2. 添加隧道
-	tunnelDir := config.ConfigDir + "/tunnels"
-	entries, err := os.ReadDir(tunnelDir)
-	if err == nil {
-		for _, entry := range entries {
-			if !strings.HasSuffix(entry.Name(), ".yaml") {
-				continue
-			}
-
-			tunnelName := strings.TrimSuffix(entry.Name(), ".yaml")
-
-			// 加载隧道配置获取启用状态
-			tunnelConfig, _ := network.LoadTunnelConfig(tunnelName)
-			enabledStatus := "禁用"
-			if tunnelConfig != nil && tunnelConfig.Enabled {
-				enabledStatus = "启用"
-			}
-
-			// 检查是否是默认路由出口
-			tunnelDisplayName := tunnelName
-			if defaultExit != "" && tunnelName == defaultExit {
-				tunnelDisplayName = tunnelName + " *"
-			}
-
-			result, ok := checkResults.Results[tunnelName]
-			var runStatus, latency, packetLoss, targetIP string
-
-			if !ok || result == nil {
-				runStatus = "未检查"
-				latency = "-"
-				packetLoss = "-"
-				targetIP = "-"
-			} else {
-				switch result.Status {
-				case "UP":
-					runStatus = "UP"
-					latency = fmt.Sprintf("%.2f", result.Latency)
-					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
-					targetIP = result.TargetIP
-				case "DOWN":
-					runStatus = "DOWN"
-					latency = fmt.Sprintf("%.2f", result.Latency)
-					packetLoss = fmt.Sprintf("%.0f%%", result.PacketLoss)
-					targetIP = result.TargetIP
-				case "IDLE":
-					runStatus = "IDLE"
-					latency = "-"
-					packetLoss = "-"
-					targetIP = "-"
-				default:
-					runStatus = "未知"
-					latency = "-"
-					packetLoss = "-"
-					targetIP = "-"
-				}
-			}
-
-			t.AppendRow(table.Row{
-				tunnelDisplayName,
-				"隧道",
-				enabledStatus,
-				runStatus,
-				latency,
-				packetLoss,
-				targetIP,
-			})
-		}
-	}
-
-	// 渲染表格
-	t.Render()
-
-	// 如果设置了默认路由，显示说明
-	if defaultExit != "" {
-		fmt.Println()
-		fmt.Printf("  * 默认路由出口: %s\n", defaultExit)
-	}
+	fmt.Println("【图例】")
+	fmt.Printf("  \033[92m✓\033[0m 正常  \033[31m✗\033[0m 异常  \033[36m○\033[0m 未检查  \033[90m⊗\033[0m 已禁用  \033[93m★\033[0m 默认路由出口\n")
 	fmt.Println()
 
 	// 显示最后检查时间

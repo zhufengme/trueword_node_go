@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/vishvananda/netlink"
 	"trueword_node/pkg/network"
 )
 
@@ -29,7 +30,8 @@ type PolicyGroup struct {
 	Name     string   // 组名
 	Priority int      // 优先级
 	Exit     string   // 出口（隧道名或物理接口名）
-	CIDRs    []string // CIDR列表
+	CIDRs    []string // 目标CIDR列表
+	From     string   // 源地址/源地址段（默认 "all"）
 }
 
 // PolicyManager 策略管理器
@@ -47,7 +49,7 @@ func NewPolicyManager() *PolicyManager {
 }
 
 // 创建策略组
-func (pm *PolicyManager) CreateGroup(name, exit string, priority int) error {
+func (pm *PolicyManager) CreateGroup(name, exit string, priority int, from string) error {
 	if _, exists := pm.groups[name]; exists {
 		return fmt.Errorf("策略组 %s 已存在", name)
 	}
@@ -64,11 +66,22 @@ func (pm *PolicyManager) CreateGroup(name, exit string, priority int) error {
 
 	fmt.Printf("✓ 出口接口 %s 类型: %s, 状态: UP\n", exit, info.Type.String())
 
+	// 解析from参数
+	parsedFrom, err := ParseFromInput(from)
+	if err != nil {
+		return fmt.Errorf("解析from参数失败: %w", err)
+	}
+
+	if parsedFrom != "all" {
+		fmt.Printf("✓ 源限制: %s\n", parsedFrom)
+	}
+
 	pm.groups[name] = &PolicyGroup{
 		Name:     name,
 		Priority: priority,
 		Exit:     exit,
 		CIDRs:    make([]string, 0),
+		From:     parsedFrom,
 	}
 
 	return nil
@@ -340,12 +353,18 @@ func (pm *PolicyManager) applyGroup(group *PolicyGroup) error {
 	cmd = fmt.Sprintf("ip rule del pref %d", group.Priority)
 	execIPCommandNoError(cmd)
 
-	// 添加策略规则
-	cmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, group.Priority)
-	if err := execIPCommand(cmd); err != nil {
+	// 添加策略规则（根据from字段）
+	var ruleCmd string
+	if group.From == "" || group.From == "all" {
+		ruleCmd = fmt.Sprintf("ip rule add from all lookup %d pref %d", tableID, group.Priority)
+	} else {
+		ruleCmd = fmt.Sprintf("ip rule add from %s lookup %d pref %d", group.From, tableID, group.Priority)
+	}
+
+	if err := execIPCommand(ruleCmd); err != nil {
 		fmt.Printf("  ✗ 添加策略规则失败\n")
 		fmt.Printf("     错误: %v\n", err)
-		fmt.Printf("     命令: %s\n", cmd)
+		fmt.Printf("     命令: %s\n", ruleCmd)
 		return err
 	}
 
@@ -522,6 +541,12 @@ func (pm *PolicyManager) Save() error {
 		content := fmt.Sprintf("# Policy Group: %s\n", group.Name)
 		content += fmt.Sprintf("# Exit: %s\n", group.Exit)
 		content += fmt.Sprintf("# Priority: %d\n", group.Priority)
+
+		// 添加From字段
+		if group.From != "" && group.From != "all" {
+			content += fmt.Sprintf("# From: %s\n", group.From)
+		}
+
 		content += "\n"
 		content += strings.Join(group.CIDRs, "\n")
 
@@ -545,6 +570,7 @@ func (pm *PolicyManager) LoadGroup(name string) error {
 
 	var exit string
 	var priority int
+	var from string
 	cidrs := make([]string, 0)
 
 	scanner := bufio.NewScanner(file)
@@ -555,6 +581,8 @@ func (pm *PolicyManager) LoadGroup(name string) error {
 			exit = strings.TrimSpace(strings.TrimPrefix(line, "# Exit:"))
 		} else if strings.HasPrefix(line, "# Priority:") {
 			fmt.Sscanf(line, "# Priority: %d", &priority)
+		} else if strings.HasPrefix(line, "# From:") {
+			from = strings.TrimSpace(strings.TrimPrefix(line, "# From:"))
 		} else if line != "" && !strings.HasPrefix(line, "#") {
 			cidrs = append(cidrs, line)
 		}
@@ -564,11 +592,17 @@ func (pm *PolicyManager) LoadGroup(name string) error {
 		return err
 	}
 
+	// 如果没有From字段，默认为"all"（向后兼容）
+	if from == "" {
+		from = "all"
+	}
+
 	group := &PolicyGroup{
 		Name:     name,
 		Exit:     exit,
 		Priority: priority,
 		CIDRs:    cidrs,
+		From:     from,
 	}
 
 	pm.groups[name] = group
@@ -674,4 +708,61 @@ func getInterfaceGateway(ifaceName string) (string, error) {
 	}
 
 	return "", nil
+}
+
+// GetInterfaceIPs 获取接口的所有IPv4地址段
+func GetInterfaceIPs(ifaceName string) ([]string, error) {
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("接口 %s 不存在: %w", ifaceName, err)
+	}
+
+	// 获取所有IPv4地址
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return nil, fmt.Errorf("获取接口地址失败: %w", err)
+	}
+
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("接口 %s 没有IPv4地址", ifaceName)
+	}
+
+	var cidrs []string
+	for _, addr := range addrs {
+		cidrs = append(cidrs, addr.IPNet.String())
+	}
+
+	return cidrs, nil
+}
+
+// ParseFromInput 解析用户输入的from参数（接口名、CIDR或IP）
+func ParseFromInput(input string) (string, error) {
+	// 空或"all"表示所有源
+	if input == "" || input == "all" {
+		return "all", nil
+	}
+
+	// 检查是否是CIDR格式
+	if _, _, err := net.ParseCIDR(input); err == nil {
+		return input, nil
+	}
+
+	// 检查是否是单个IP
+	if ip := net.ParseIP(input); ip != nil {
+		// 单个IP转为/32 CIDR
+		return input + "/32", nil
+	}
+
+	// 尝试作为接口名处理
+	cidrs, err := GetInterfaceIPs(input)
+	if err != nil {
+		return "", fmt.Errorf("无法识别输入 '%s': 不是有效的CIDR、IP或接口名", input)
+	}
+
+	// 接口可能有多个IP，取第一个
+	if len(cidrs) > 1 {
+		fmt.Printf("注意: 接口 %s 有多个IP地址，使用第一个: %s\n", input, cidrs[0])
+	}
+
+	return cidrs[0], nil
 }
