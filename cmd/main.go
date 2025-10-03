@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"strings"
 	"syscall"
@@ -919,9 +920,77 @@ func main() {
 		},
 	}
 
+	// failover命令
+	policyFailoverCmd := &cobra.Command{
+		Use:   "failover <group_name|default> <candidate1,candidate2,...> [check_ip]",
+		Short: "根据连通性检查自动切换到最佳出口",
+		Long: "使用上次检查结果（line check）选择最佳出口并应用\n" +
+			"示例: twnode policy failover vpn_group eth0,tun01,tun02\n\n" +
+			"提供 check_ip 参数时将重新检查所有候选出口：\n" +
+			"示例: twnode policy failover vpn_group eth0,tun01,tun02 8.8.8.8",
+		Args: cobra.RangeArgs(2, 3),
+		Run: func(cmd *cobra.Command, args []string) {
+			target := args[0]
+			candidatesStr := args[1]
+
+			var checkIP string
+			if len(args) >= 3 {
+				checkIP = args[2]
+				// 验证 IP 地址格式
+				if net.ParseIP(checkIP) == nil {
+					fmt.Fprintf(os.Stderr, "无效的 IP 地址: %s\n", checkIP)
+					os.Exit(1)
+				}
+			}
+
+			// 解析候选出口列表
+			candidates := strings.Split(candidatesStr, ",")
+			for i := range candidates {
+				candidates[i] = strings.TrimSpace(candidates[i])
+			}
+
+			if len(candidates) == 0 {
+				fmt.Fprintln(os.Stderr, "候选出口列表不能为空")
+				os.Exit(1)
+			}
+
+			pm := routing.NewPolicyManager()
+
+			if target == "default" {
+				// 切换默认路由
+				// 加载配置获取当前默认出口
+				cfg, err := config.Load()
+				if err == nil && cfg.Routing.DefaultExit != "" {
+					pm.SetDefaultExit(cfg.Routing.DefaultExit)
+				}
+
+				if err := pm.FailoverDefault(candidates, checkIP); err != nil {
+					fmt.Fprintf(os.Stderr, "切换默认路由失败: %v\n", err)
+					os.Exit(1)
+				}
+
+				// 保存新的默认路由到配置文件
+				if cfg == nil {
+					cfg = &config.Config{}
+				}
+				cfg.Routing.DefaultExit = pm.GetDefaultExit()
+				if err := cfg.Save(); err != nil {
+					fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// 切换策略组
+				if err := pm.FailoverGroup(target, candidates, checkIP); err != nil {
+					fmt.Fprintf(os.Stderr, "切换策略组失败: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		},
+	}
+
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
-		policyApplyCmd, policyRevokeCmd)
+		policyApplyCmd, policyRevokeCmd, policyFailoverCmd)
 
 	// 添加所有命令
 	rootCmd.AddCommand(initCmd, statusCmd, interfaceCmd, lineCmd, policyCmd)

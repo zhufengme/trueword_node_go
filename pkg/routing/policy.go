@@ -159,6 +159,11 @@ func (pm *PolicyManager) SetDefaultExit(exit string) {
 	pm.defaultExit = exit
 }
 
+// 获取默认路由出口
+func (pm *PolicyManager) GetDefaultExit() string {
+	return pm.defaultExit
+}
+
 // 检查出口是否有效
 func (pm *PolicyManager) checkExitValid(exit string) error {
 	// 检查接口是否存在
@@ -765,4 +770,319 @@ func ParseFromInput(input string) (string, error) {
 	}
 
 	return cidrs[0], nil
+}
+
+// ExitScore 出口评分结果
+type ExitScore struct {
+	Name        string
+	Latency     float64
+	PacketLoss  float64
+	Score       float64
+	Available   bool
+	Reason      string
+}
+
+// calculateScore 计算出口评分
+func calculateScore(latency, packetLoss float64) float64 {
+	var score float64
+
+	// 丢包率评分（0-60分）
+	if packetLoss == 0 {
+		score += 60
+	} else if packetLoss <= 5 {
+		score += 45
+	} else if packetLoss <= 10 {
+		score += 30
+	} else if packetLoss <= 20 {
+		score += 15
+	} else {
+		score += 0
+	}
+
+	// 延迟评分（0-40分）
+	if latency < 50 {
+		score += 40
+	} else if latency < 100 {
+		score += 35
+	} else if latency < 150 {
+		score += 30
+	} else if latency < 200 {
+		score += 25
+	} else if latency < 300 {
+		score += 15
+	} else {
+		score += 5
+	}
+
+	return score
+}
+
+// SelectBestExit 从候选出口中选择最佳出口
+func SelectBestExit(candidates []string, checkResults *network.AllCheckResults) (*ExitScore, []*ExitScore, error) {
+	if len(candidates) == 0 {
+		return nil, nil, fmt.Errorf("候选出口列表为空")
+	}
+
+	scores := make([]*ExitScore, 0, len(candidates))
+	var bestExit *ExitScore
+
+	for _, candidate := range candidates {
+		exitScore := &ExitScore{
+			Name:      candidate,
+			Available: false,
+		}
+
+		// 检查是否有检查结果
+		result, ok := checkResults.Results[candidate]
+		if !ok || result == nil {
+			exitScore.Reason = "未检查"
+			scores = append(scores, exitScore)
+			continue
+		}
+
+		// 检查状态
+		if result.Status != "UP" {
+			exitScore.Reason = result.Status
+			scores = append(scores, exitScore)
+			continue
+		}
+
+		// 计算评分
+		exitScore.Latency = result.Latency
+		exitScore.PacketLoss = result.PacketLoss
+		exitScore.Score = calculateScore(result.Latency, result.PacketLoss)
+		exitScore.Available = true
+
+		scores = append(scores, exitScore)
+
+		// 选择最佳
+		if bestExit == nil {
+			bestExit = exitScore
+		} else if exitScore.Score > bestExit.Score {
+			bestExit = exitScore
+		} else if exitScore.Score == bestExit.Score && exitScore.Latency < bestExit.Latency {
+			// 分数相同，选择延迟更低的
+			bestExit = exitScore
+		}
+	}
+
+	if bestExit == nil {
+		return nil, scores, fmt.Errorf("所有候选出口均不可用")
+	}
+
+	return bestExit, scores, nil
+}
+
+// checkCandidates 检查候选出口连通性并保存结果
+func checkCandidates(candidates []string, checkIP string) error {
+	fmt.Println("检查出口连通性...")
+
+	// 加载现有检查结果
+	allResults, err := network.LoadCheckResults()
+	if err != nil {
+		allResults = &network.AllCheckResults{
+			Results: make(map[string]*network.CheckResult),
+		}
+	}
+
+	// 检查每个候选出口
+	for _, candidate := range candidates {
+		fmt.Printf("  检查 %s -> %s ... ", candidate, checkIP)
+
+		result := network.CheckInterface(candidate, []string{checkIP})
+		if result == nil {
+			fmt.Printf("✗ (检查失败)\n")
+			continue
+		}
+
+		// 保存结果到 allResults
+		allResults.Results[candidate] = result
+
+		if result.Status == "UP" {
+			fmt.Printf("✓ (%.1fms, %.0f%% 丢包)\n", result.Latency, result.PacketLoss)
+		} else {
+			fmt.Printf("✗ (%s)\n", result.Status)
+		}
+	}
+
+	// 保存检查结果（SaveCheckResults 会自动更新时间戳）
+	if err := network.SaveCheckResults(allResults); err != nil {
+		return fmt.Errorf("保存检查结果失败: %w", err)
+	}
+
+	fmt.Println()
+	return nil
+}
+
+// printScores 打印评分结果
+func printScores(scores []*ExitScore, bestExit *ExitScore) {
+	fmt.Println("候选出口评分:")
+
+	for _, score := range scores {
+		if score.Available {
+			best := ""
+			if bestExit != nil && score.Name == bestExit.Name {
+				best = " \033[93m★ 最佳\033[0m"
+			}
+			fmt.Printf("  \033[1m%-10s\033[0m | 延迟: \033[96m%-8.1fms\033[0m 丢包率: \033[96m%-6.0f%%\033[0m | 评分: \033[92m%.1f\033[0m%s\n",
+				score.Name, score.Latency, score.PacketLoss, score.Score, best)
+		} else {
+			fmt.Printf("  \033[1m%-10s\033[0m | 状态: \033[90m%-25s\033[0m | 不可用\n",
+				score.Name, score.Reason)
+		}
+	}
+	fmt.Println()
+}
+
+// FailoverGroup 对策略组执行 failover
+func (pm *PolicyManager) FailoverGroup(groupName string, candidates []string, checkIP string) error {
+	fmt.Printf("准备 failover: %s -> 候选出口 [%s]\n\n", groupName, strings.Join(candidates, ", "))
+
+	// 验证策略组是否存在
+	if err := pm.LoadGroup(groupName); err != nil {
+		return fmt.Errorf("策略组 %s 不存在", groupName)
+	}
+
+	group := pm.groups[groupName]
+	if group == nil {
+		return fmt.Errorf("策略组 %s 不存在", groupName)
+	}
+
+	// 验证候选出口是否存在
+	for _, candidate := range candidates {
+		if !network.IsInterfaceUp(candidate) {
+			// 尝试作为隧道检查
+			_, err := network.LoadTunnelConfig(candidate)
+			if err != nil {
+				return fmt.Errorf("候选出口 %s 不存在", candidate)
+			}
+		}
+	}
+
+	// 根据参数决定是否执行检查
+	if checkIP != "" {
+		// 提供了 check_ip，执行检查
+		if err := checkCandidates(candidates, checkIP); err != nil {
+			return err
+		}
+	} else {
+		// 未提供 check_ip，使用现有检查结果
+		fmt.Println("使用上次检查结果（未指定 check_ip）")
+	}
+
+	// 加载检查结果
+	checkResults, err := network.LoadCheckResults()
+	if err != nil {
+		return fmt.Errorf("加载检查结果失败: %w (提示: 请先运行 'twnode line check <ip>' 或使用 --force 参数)", err)
+	}
+
+	// 选择最佳出口
+	bestExit, scores, err := SelectBestExit(candidates, checkResults)
+	if err != nil {
+		return err
+	}
+
+	// 打印评分
+	printScores(scores, bestExit)
+
+	fmt.Printf("选择最佳出口: \033[92m%s\033[0m (评分: %.1f)\n\n", bestExit.Name, bestExit.Score)
+
+	// 检查是否需要切换
+	if group.Exit == bestExit.Name {
+		fmt.Printf("当前出口已是最佳选择 (%s)，无需切换\n", group.Exit)
+		return nil
+	}
+
+	fmt.Printf("当前出口: \033[33m%s\033[0m -> 新出口: \033[92m%s\033[0m\n\n", group.Exit, bestExit.Name)
+
+	// 切换出口
+	fmt.Printf("应用策略组 '%s' 切换...\n", groupName)
+	group.Exit = bestExit.Name
+
+	// 保存配置
+	if err := pm.Save(); err != nil {
+		return fmt.Errorf("保存配置失败: %w", err)
+	}
+	fmt.Printf("  ✓ 出口已更改为 %s\n", bestExit.Name)
+	fmt.Printf("  ✓ 配置已保存\n")
+
+	// 重新应用策略
+	if err := pm.Apply(); err != nil {
+		return fmt.Errorf("应用策略失败: %w", err)
+	}
+	fmt.Printf("  ✓ 策略已应用\n\n")
+
+	fmt.Println("\033[92mFailover 完成！\033[0m")
+	return nil
+}
+
+// FailoverDefault 对默认路由执行 failover
+func (pm *PolicyManager) FailoverDefault(candidates []string, checkIP string) error {
+	fmt.Printf("准备 failover: 默认路由 -> 候选出口 [%s]\n\n", strings.Join(candidates, ", "))
+
+	// 验证候选出口是否存在
+	for _, candidate := range candidates {
+		if !network.IsInterfaceUp(candidate) {
+			// 尝试作为隧道检查
+			_, err := network.LoadTunnelConfig(candidate)
+			if err != nil {
+				return fmt.Errorf("候选出口 %s 不存在", candidate)
+			}
+		}
+	}
+
+	// 根据参数决定是否执行检查
+	if checkIP != "" {
+		// 提供了 check_ip，执行检查
+		if err := checkCandidates(candidates, checkIP); err != nil {
+			return err
+		}
+	} else {
+		// 未提供 check_ip，使用现有检查结果
+		fmt.Println("使用上次检查结果（未指定 check_ip）")
+	}
+
+	// 加载检查结果
+	checkResults, err := network.LoadCheckResults()
+	if err != nil {
+		return fmt.Errorf("加载检查结果失败: %w (提示: 请先运行 'twnode line check <ip>' 或使用 --force 参数)", err)
+	}
+
+	// 选择最佳出口
+	bestExit, scores, err := SelectBestExit(candidates, checkResults)
+	if err != nil {
+		return err
+	}
+
+	// 打印评分
+	printScores(scores, bestExit)
+
+	fmt.Printf("选择最佳出口: \033[92m%s\033[0m (评分: %.1f)\n\n", bestExit.Name, bestExit.Score)
+
+	// 检查是否需要切换
+	currentExit := pm.defaultExit
+	if currentExit == bestExit.Name {
+		fmt.Printf("当前出口已是最佳选择 (%s)，无需切换\n", currentExit)
+		return nil
+	}
+
+	if currentExit == "" {
+		fmt.Printf("设置默认路由出口: \033[92m%s\033[0m\n\n", bestExit.Name)
+	} else {
+		fmt.Printf("当前出口: \033[33m%s\033[0m -> 新出口: \033[92m%s\033[0m\n\n", currentExit, bestExit.Name)
+	}
+
+	// 切换出口
+	fmt.Println("应用默认路由切换...")
+	pm.SetDefaultExit(bestExit.Name)
+
+	// 应用默认路由
+	if err := pm.ApplyDefaultRouteOnly(); err != nil {
+		return fmt.Errorf("应用默认路由失败: %w", err)
+	}
+	fmt.Printf("  ✓ 默认路由已切换到 %s\n", bestExit.Name)
+	fmt.Printf("  ✓ 配置已保存\n\n")
+
+	fmt.Println("\033[92mFailover 完成！\033[0m")
+	return nil
 }
