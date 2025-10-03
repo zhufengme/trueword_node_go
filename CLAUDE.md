@@ -165,12 +165,24 @@ twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunn
 
 ### 策略路由流程 (policy)
 
-1. 创建策略组（指定出口接口）
+**策略组管理支持局部操作**：
+- 应用：`twnode policy apply` 或 `twnode policy apply <group_name>`
+- 撤销：`twnode policy revoke` 或 `twnode policy revoke <group_name>`
+- 删除：`twnode policy delete <group_name>`（自动检测并撤销已应用的策略）
+
+**应用流程**：
+1. 创建策略组（指定出口接口和可选的 from 源地址限制）
 2. 添加 CIDR 到策略组
 3. **Apply** 时检查出口接口状态
 4. 自动添加保护路由（优先级10，保护隧道底层连接）
-5. 应用所有策略组路由规则
+5. 应用策略组路由规则（先添加新规则，再清理重复规则，避免网络中断）
 6. 可选：设置默认路由（0.0.0.0/0，优先级900）
+
+**故障转移（Failover）流程**：
+1. 指定策略组或默认路由及候选出口列表
+2. 可选：提供 check_ip 重新检查，或使用 `line check` 的历史结果
+3. 根据评分算法（60% 丢包率 + 40% 延迟）选择最佳出口
+4. 自动切换策略组或默认路由到最佳出口
 
 实现：`pkg/routing/policy.go`
 
@@ -200,9 +212,47 @@ func sortIPs(ip1, ip2 string) (string, string)  // 按字典序排序
 func generateSPI(ip1, ip2 string) string       // MD5(ip1+ip2)[:8]
 ```
 
+### 策略规则管理（关键）
+
+**避免网络中断的规则更新策略**：
+
+在 `ApplyGroup()` 和 `applyDefaultRoute()` 中，采用"先添加后清理"的策略：
+
+1. **先添加新规则**（`ip rule add`）
+2. **循环检测并清理重复规则**：
+   - 使用 `ip rule show pref X | wc -l` 检查规则数量
+   - 如果数量 > 1，删除一个
+   - 重复直到只剩一个规则
+3. **最后验证规则存在**，如被意外删除则重新添加
+
+这确保：
+- 始终至少有一个规则存在，不会中断网络
+- 清理重复规则，避免冲突
+- 有验证和恢复机制
+
+**错误的做法**（会导致网络中断）：
+```go
+// 错误：先删除旧规则，再添加新规则
+ip rule del pref X  // 删除规则
+ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由）
+```
+
 ### 网络操作库
 
 项目使用 **github.com/vishvananda/netlink** 库进行网络配置，而不是直接调用系统命令。仅在必需时（如 `ip xfrm`）才使用 `exec.Command`。
+
+### 连通性检查和评分
+
+**检查结果持久化**：
+- 检查结果保存到 `/var/lib/trueword_node/check_results.json`
+- 使用 `network.CheckInterface()` 执行检查
+- 使用 `network.SaveCheckResults()` 保存结果
+- Failover 功能依赖这些检查结果
+
+**评分算法**：
+- 丢包率评分：0-60 分（用户对丢包更敏感）
+- 延迟评分：0-40 分
+- 总分：0-100 分，分数越高越好
 
 ## UI 设计原则
 
@@ -227,12 +277,25 @@ func generateSPI(ip1, ip2 string) string       // MD5(ip1+ip2)[:8]
 ### 添加新的策略路由功能
 
 1. 在 `pkg/routing/policy.go` 中添加逻辑
-2. 注意优先级范围限制
-3. 在 `cmd/main.go` 中添加子命令
+2. **注意策略规则管理**：必须使用"先添加后清理"的策略避免网络中断
+3. 注意优先级范围限制（100-899 为用户策略组范围）
+4. 在 `cmd/main.go` 中添加子命令
+5. 考虑是否需要支持局部操作（单个策略组 vs 所有策略）
 
 ### 修改物理接口扫描逻辑
 
 修改 `pkg/network/interface.go` 中的 `ScanPhysicalInterfaces()` 函数，该函数使用 netlink 库扫描接口。
+
+### 修改策略应用逻辑时的注意事项
+
+**关键原则**：策略规则的更新必须保证无缝切换，避免网络中断
+
+- ❌ 不要先删除旧规则再添加新规则
+- ✓ 应该先添加新规则，再清理重复规则
+- ✓ 使用循环检测确保只保留一个规则
+- ✓ 添加验证和恢复机制
+
+参考 `ApplyGroup()` 和 `applyDefaultRoute()` 中的实现。
 
 ## 依赖项
 
