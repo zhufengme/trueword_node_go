@@ -147,7 +147,11 @@ func pingWithRoute(targetIP, exitInterface string, count int, timeout int) (avgL
 	defer removeTestPolicyRoute(targetIP)
 
 	// 执行ping
-	cmd := exec.Command("ping", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeout), targetIP)
+	// -c: 包数量
+	// -W: 超时时间(秒)
+	// -i: 包间隔(秒)，0.2秒可大幅提速
+	// -A: 自适应模式，收到回复后立即发送下一个包
+	cmd := exec.Command("ping", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeout), "-i", "0.2", targetIP)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -200,7 +204,7 @@ func CheckTunnel(tunnelName string, targetIPs []string) *CheckResult {
 	}
 
 	for _, targetIP := range targetIPs {
-		avgLatency, packetLoss, err := pingWithRoute(targetIP, tunnelName, 20, 2)
+		avgLatency, packetLoss, err := pingWithRoute(targetIP, tunnelName, 20, 1)
 
 		// 记录最后一次测试结果
 		lastResult.targetIP = targetIP
@@ -311,7 +315,7 @@ func CheckInterface(interfaceName string, targetIPs []string) *CheckResult {
 	}
 
 	for _, targetIP := range targetIPs {
-		avgLatency, packetLoss, err := pingWithRoute(targetIP, interfaceName, 20, 2)
+		avgLatency, packetLoss, err := pingWithRoute(targetIP, interfaceName, 20, 1)
 
 		// 记录最后一次测试结果
 		lastResult.targetIP = targetIP
