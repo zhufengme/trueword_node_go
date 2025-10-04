@@ -877,10 +877,10 @@ func ParseFromInput(input string) (string, error) {
 	}
 
 	// 尝试作为接口名处理
-	// 1. 先检查是否是隧道接口(P2P类型)
+	// 1. 先检查是否是本地管理的隧道接口(P2P类型)
 	tunnelConfig, err := network.LoadTunnelConfig(input)
 	if err == nil && tunnelConfig != nil {
-		// 是隧道接口，使用对端VIP作为from源
+		// 是本地管理的隧道接口，使用对端VIP作为from源
 		if tunnelConfig.RemoteVIP != "" {
 			fmt.Printf("注意: 接口 %s 是P2P隧道，使用对端VIP: %s\n", input, tunnelConfig.RemoteVIP)
 			return tunnelConfig.RemoteVIP + "/32", nil
@@ -888,18 +888,24 @@ func ParseFromInput(input string) (string, error) {
 		return "", fmt.Errorf("隧道 %s 没有配置对端VIP", input)
 	}
 
-	// 2. 不是隧道，尝试作为物理接口处理
+	// 2. 检查是否是物理接口
 	cidrs, err := GetInterfaceIPs(input)
-	if err != nil {
-		return "", fmt.Errorf("无法识别输入 '%s': 不是有效的CIDR、IP或接口名", input)
+	if err == nil && len(cidrs) > 0 {
+		// 是物理接口，使用本端IP
+		if len(cidrs) > 1 {
+			fmt.Printf("注意: 接口 %s 有多个IP地址，使用第一个: %s\n", input, cidrs[0])
+		}
+		return cidrs[0], nil
 	}
 
-	// 接口可能有多个IP，取第一个
-	if len(cidrs) > 1 {
-		fmt.Printf("注意: 接口 %s 有多个IP地址，使用第一个: %s\n", input, cidrs[0])
+	// 3. 检查接口是否存在于系统中（可能是第三方隧道）
+	if network.IsInterfaceUp(input) {
+		// 接口存在但无法自动获取对端IP（第三方隧道）
+		return "", fmt.Errorf("接口 %s 是第三方隧道或P2P接口，无法自动获取对端IP，请手动输入对端IP地址", input)
 	}
 
-	return cidrs[0], nil
+	// 4. 接口不存在
+	return "", fmt.Errorf("无法识别输入 '%s': 不是有效的CIDR、IP或接口名", input)
 }
 
 // ExitScore 出口评分结果
