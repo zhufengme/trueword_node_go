@@ -200,7 +200,7 @@ func CheckTunnel(tunnelName string, targetIPs []string) *CheckResult {
 	}
 
 	for _, targetIP := range targetIPs {
-		avgLatency, packetLoss, err := pingWithRoute(targetIP, tunnelName, 4, 2)
+		avgLatency, packetLoss, err := pingWithRoute(targetIP, tunnelName, 20, 2)
 
 		// 记录最后一次测试结果
 		lastResult.targetIP = targetIP
@@ -311,7 +311,7 @@ func CheckInterface(interfaceName string, targetIPs []string) *CheckResult {
 	}
 
 	for _, targetIP := range targetIPs {
-		avgLatency, packetLoss, err := pingWithRoute(targetIP, interfaceName, 4, 2)
+		avgLatency, packetLoss, err := pingWithRoute(targetIP, interfaceName, 20, 2)
 
 		// 记录最后一次测试结果
 		lastResult.targetIP = targetIP
