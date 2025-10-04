@@ -85,6 +85,9 @@ func addTestPolicyRoute(targetIP, exitInterface string) error {
 	// 使用一个临时路由表（例如表5）
 	tableID := TestPolicyPriority
 
+	// 先清理可能存在的旧规则和路由（确保干净状态）
+	removeTestPolicyRoute(targetIP)
+
 	// 添加路由规则
 	cmd := exec.Command("ip", "rule", "add", "to", targetIP, "lookup", strconv.Itoa(tableID), "pref", strconv.Itoa(TestPolicyPriority))
 	if err := cmd.Run(); err != nil {
