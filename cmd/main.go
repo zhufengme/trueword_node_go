@@ -125,28 +125,16 @@ func interactiveCreateLine() error {
 		fmt.Printf("自动生成隧道名: %s\n", tunnelName)
 	}
 
-	// 7. 是否使用加密
-	useEncryption := true
-	encChoice := readInput("是否使用IPsec加密? (Y/n): ")
-	if strings.ToLower(strings.TrimSpace(encChoice)) == "n" {
-		useEncryption = false
-	}
-
-	// 8. 输入认证密钥
-	authPass := readPassword("认证密钥 (不显示): ")
+	// 7. 输入认证密钥
+	authPass := readInput("认证密钥: ")
 	if authPass == "" {
 		return fmt.Errorf("认证密钥不能为空")
 	}
 
-	// 9. 输入加密密钥
-	var encPass string
-	if useEncryption {
-		encPass = readPassword("加密密钥 (不显示): ")
-		if encPass == "" {
-			return fmt.Errorf("加密密钥不能为空")
-		}
-	} else {
-		encPass = authPass // 不加密时使用相同的密钥
+	// 8. 输入加密密钥
+	encPass := readInput("加密密钥: ")
+	if encPass == "" {
+		return fmt.Errorf("加密密钥不能为空")
 	}
 
 	// 9.5. 输入成本值
@@ -176,7 +164,6 @@ func interactiveCreateLine() error {
 	fmt.Printf("远程虚拟IP:  %s\n", remoteVIP)
 	fmt.Printf("本地虚拟IP:  %s\n", localVIP)
 	fmt.Printf("隧道名:      %s\n", tunnelName)
-	fmt.Printf("使用加密:    %v\n", useEncryption)
 	fmt.Printf("成本:        %d\n", cost)
 	fmt.Println(strings.Repeat("=", 60))
 
@@ -198,7 +185,7 @@ func interactiveCreateLine() error {
 		EncKey:          encKey,
 		Cost:            cost,
 		Enabled:         true,
-		UseEncryption:   useEncryption,
+		UseEncryption:   true, // 默认始终加密
 	}
 
 	// 13. 使用TunnelManager创建
@@ -408,7 +395,6 @@ func main() {
 			// 获取密钥
 			authPass, _ := cmd.Flags().GetString("auth-key")
 			encPass, _ := cmd.Flags().GetString("enc-key")
-			noEncrypt, _ := cmd.Flags().GetBool("no-encrypt")
 			cost, _ := cmd.Flags().GetInt("cost")
 
 			if authPass == "" {
@@ -423,8 +409,8 @@ func main() {
 				os.Exit(1)
 			}
 
-			// 如果不加密，使用相同的密钥
-			if noEncrypt || encPass == "" {
+			// 如果未指定加密密钥，使用认证密钥
+			if encPass == "" {
 				encPass = authPass
 			}
 
@@ -447,7 +433,7 @@ func main() {
 				EncKey:          encKey,
 				Cost:            cost,
 				Enabled:         true,
-				UseEncryption:   !noEncrypt,
+				UseEncryption:   true, // 始终加密
 			}
 
 			// 使用TunnelManager创建
@@ -460,7 +446,6 @@ func main() {
 	}
 	lineCreateCmd.Flags().String("auth-key", "", "认证密钥字符串(命令行模式必需)")
 	lineCreateCmd.Flags().String("enc-key", "", "加密密钥字符串(可选,不指定则使用auth-key)")
-	lineCreateCmd.Flags().Bool("no-encrypt", false, "不使用IPsec加密")
 	lineCreateCmd.Flags().Int("cost", 0, "成本值(0-100,默认0)")
 
 	// 删除隧道
