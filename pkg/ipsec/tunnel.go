@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"trueword_node/pkg/network"
 )
 
 const (
@@ -297,13 +299,22 @@ func (t *Tunnel) Create() error {
 
 // 删除隧道
 func RemoveTunnel(tunnelName string) error {
+	fmt.Printf("删除隧道: %s\n", tunnelName)
+
+	// 1. 执行撤销命令清理网络配置
 	revFile := fmt.Sprintf("%s.rev", tunnelName)
-
 	if err := executeRevCommands(revFile); err != nil {
-		return fmt.Errorf("❌ 删除失败: %w", err)
+		return fmt.Errorf("❌ 清理网络配置失败: %w", err)
 	}
+	fmt.Printf("  ✓ 网络配置已清理\n")
 
-	fmt.Printf("✓ 隧道 %s 已删除\n", tunnelName)
+	// 2. 删除隧道配置文件
+	if err := network.DeleteTunnelConfig(tunnelName); err != nil {
+		return fmt.Errorf("❌ 删除配置文件失败: %w", err)
+	}
+	fmt.Printf("  ✓ 配置文件已删除\n")
+
+	fmt.Printf("✓ 隧道 %s 删除完成\n", tunnelName)
 	return nil
 }
 
