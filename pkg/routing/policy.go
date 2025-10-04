@@ -877,6 +877,18 @@ func ParseFromInput(input string) (string, error) {
 	}
 
 	// 尝试作为接口名处理
+	// 1. 先检查是否是隧道接口(P2P类型)
+	tunnelConfig, err := network.LoadTunnelConfig(input)
+	if err == nil && tunnelConfig != nil {
+		// 是隧道接口，使用对端VIP作为from源
+		if tunnelConfig.RemoteVIP != "" {
+			fmt.Printf("注意: 接口 %s 是P2P隧道，使用对端VIP: %s\n", input, tunnelConfig.RemoteVIP)
+			return tunnelConfig.RemoteVIP + "/32", nil
+		}
+		return "", fmt.Errorf("隧道 %s 没有配置对端VIP", input)
+	}
+
+	// 2. 不是隧道，尝试作为物理接口处理
 	cidrs, err := GetInterfaceIPs(input)
 	if err != nil {
 		return "", fmt.Errorf("无法识别输入 '%s': 不是有效的CIDR、IP或接口名", input)
