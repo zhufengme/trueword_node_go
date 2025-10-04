@@ -21,6 +21,11 @@ import (
 	"trueword_node/pkg/system"
 )
 
+const (
+	// 版本信息
+	Version = "1.1"
+)
+
 var (
 	// 全局配置
 	cfg *config.Config
@@ -1187,8 +1192,18 @@ func main() {
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
 		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policyDeleteCmd)
 
+	// 版本命令
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "显示版本信息",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("TrueWord Node v%s\n", Version)
+			fmt.Println("GRE over IPsec 隧道管理工具")
+		},
+	}
+
 	// 添加所有命令
-	rootCmd.AddCommand(initCmd, statusCmd, interfaceCmd, lineCmd, policyCmd)
+	rootCmd.AddCommand(initCmd, statusCmd, interfaceCmd, lineCmd, policyCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
