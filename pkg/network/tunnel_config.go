@@ -22,6 +22,7 @@ type TunnelConfig struct {
 	RemoteVIP       string `yaml:"remote_vip"`       // 远程虚拟IP
 	AuthKey         string `yaml:"auth_key"`         // 认证密钥
 	EncKey          string `yaml:"enc_key"`          // 加密密钥
+	Cost            int    `yaml:"cost"`             // 成本 (0-100, 默认0)
 	Enabled         bool   `yaml:"enabled"`          // 是否启用
 	UseEncryption   bool   `yaml:"use_encryption"`   // 是否使用IPsec加密
 }

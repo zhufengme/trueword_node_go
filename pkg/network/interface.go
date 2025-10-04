@@ -20,6 +20,7 @@ type PhysicalInterface struct {
 	Name    string `yaml:"name"`    // 接口名 (如 eth0, ens33)
 	IP      string `yaml:"ip"`      // IP地址
 	Gateway string `yaml:"gateway"` // 网关地址
+	Cost    int    `yaml:"cost"`    // 成本 (0-100, 默认0)
 	Enabled bool   `yaml:"enabled"` // 是否启用
 }
 

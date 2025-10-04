@@ -149,6 +149,18 @@ func interactiveCreateLine() error {
 		encPass = authPass // 不加密时使用相同的密钥
 	}
 
+	// 9.5. 输入成本值
+	var cost int
+	costInput := readInput("成本值 (0-100, 默认0, 直接回车跳过): ")
+	if costInput != "" {
+		if _, err := fmt.Sscanf(costInput, "%d", &cost); err != nil {
+			return fmt.Errorf("成本值必须是数字: %w", err)
+		}
+		if cost < 0 || cost > 100 {
+			return fmt.Errorf("成本值必须在0-100之间")
+		}
+	}
+
 	// 10. 生成密钥
 	authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
 	if err != nil {
@@ -165,6 +177,7 @@ func interactiveCreateLine() error {
 	fmt.Printf("本地虚拟IP:  %s\n", localVIP)
 	fmt.Printf("隧道名:      %s\n", tunnelName)
 	fmt.Printf("使用加密:    %v\n", useEncryption)
+	fmt.Printf("成本:        %d\n", cost)
 	fmt.Println(strings.Repeat("=", 60))
 
 	confirm := readInput("\n确认创建? (yes/no): ")
@@ -183,6 +196,7 @@ func interactiveCreateLine() error {
 		RemoteVIP:       remoteVIP,
 		AuthKey:         authKey,
 		EncKey:          encKey,
+		Cost:            cost,
 		Enabled:         true,
 		UseEncryption:   useEncryption,
 	}
@@ -274,7 +288,53 @@ func main() {
 		},
 	}
 
-	interfaceCmd.AddCommand(interfaceListCmd, interfaceScanCmd)
+	// 设置接口成本
+	interfaceSetCostCmd := &cobra.Command{
+		Use:   "set-cost <interface_name> <cost>",
+		Short: "设置物理接口的成本值",
+		Long:  "设置物理接口的成本值(0-100)，用于故障转移评分",
+		Args:  cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			interfaceName := args[0]
+			var cost int
+			if _, err := fmt.Sscanf(args[1], "%d", &cost); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: 成本值必须是数字\n")
+				os.Exit(1)
+			}
+
+			if cost < 0 || cost > 100 {
+				fmt.Fprintf(os.Stderr, "错误: 成本值必须在 0-100 之间\n")
+				os.Exit(1)
+			}
+
+			// 加载接口配置
+			ifaceConfig, err := network.LoadInterfaceConfig()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载接口配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 查找接口
+			iface := ifaceConfig.GetInterfaceByName(interfaceName)
+			if iface == nil {
+				fmt.Fprintf(os.Stderr, "错误: 接口 %s 不存在\n", interfaceName)
+				os.Exit(1)
+			}
+
+			// 更新成本
+			iface.Cost = cost
+
+			// 保存配置
+			if err := network.SaveInterfaceConfig(ifaceConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("✓ 接口 %s 的成本已设置为 %d\n", interfaceName, cost)
+		},
+	}
+
+	interfaceCmd.AddCommand(interfaceListCmd, interfaceScanCmd, interfaceSetCostCmd)
 
 	// 初始化命令
 	initCmd := &cobra.Command{
@@ -349,10 +409,17 @@ func main() {
 			authPass, _ := cmd.Flags().GetString("auth-key")
 			encPass, _ := cmd.Flags().GetString("enc-key")
 			noEncrypt, _ := cmd.Flags().GetBool("no-encrypt")
+			cost, _ := cmd.Flags().GetInt("cost")
 
 			if authPass == "" {
 				fmt.Fprintln(os.Stderr, "错误: 命令行模式必须指定 --auth-key")
 				fmt.Fprintln(os.Stderr, "或不带参数进入交互模式: twnode line create")
+				os.Exit(1)
+			}
+
+			// 验证成本值范围
+			if cost < 0 || cost > 100 {
+				fmt.Fprintln(os.Stderr, "错误: cost 必须在 0-100 之间")
 				os.Exit(1)
 			}
 
@@ -378,6 +445,7 @@ func main() {
 				RemoteVIP:       remoteVIP,
 				AuthKey:         authKey,
 				EncKey:          encKey,
+				Cost:            cost,
 				Enabled:         true,
 				UseEncryption:   !noEncrypt,
 			}
@@ -393,6 +461,7 @@ func main() {
 	lineCreateCmd.Flags().String("auth-key", "", "认证密钥字符串(命令行模式必需)")
 	lineCreateCmd.Flags().String("enc-key", "", "加密密钥字符串(可选,不指定则使用auth-key)")
 	lineCreateCmd.Flags().Bool("no-encrypt", false, "不使用IPsec加密")
+	lineCreateCmd.Flags().Int("cost", 0, "成本值(0-100,默认0)")
 
 	// 删除隧道
 	lineRemoveCmd := &cobra.Command{
@@ -618,8 +687,47 @@ func main() {
 		},
 	}
 
+	// 设置隧道成本
+	lineSetCostCmd := &cobra.Command{
+		Use:   "set-cost <tunnel_name> <cost>",
+		Short: "设置隧道的成本值",
+		Long:  "设置隧道的成本值(0-100)，用于故障转移评分",
+		Args:  cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+			var cost int
+			if _, err := fmt.Sscanf(args[1], "%d", &cost); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: 成本值必须是数字\n")
+				os.Exit(1)
+			}
+
+			if cost < 0 || cost > 100 {
+				fmt.Fprintf(os.Stderr, "错误: 成本值必须在 0-100 之间\n")
+				os.Exit(1)
+			}
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 更新成本
+			tunnelConfig.Cost = cost
+
+			// 保存配置
+			if err := network.SaveTunnelConfig(tunnelConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("✓ 隧道 %s 的成本已设置为 %d\n", tunnelName, cost)
+		},
+	}
+
 	lineCmd.AddCommand(lineCreateCmd, lineRemoveCmd, lineStartCmd, lineStopCmd,
-		lineEnableCmd, lineDisableCmd, lineCheckCmd, lineStartAllCmd, lineStopAllCmd)
+		lineEnableCmd, lineDisableCmd, lineCheckCmd, lineStartAllCmd, lineStopAllCmd, lineSetCostCmd)
 
 	// 策略路由命令组
 	policyCmd := &cobra.Command{

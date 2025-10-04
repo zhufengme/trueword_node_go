@@ -191,7 +191,7 @@ func printNode(node *InterfaceNode, prefix string, isLast bool) {
 			case "IDLE":
 				statusIcon = "○"
 				statusColor = colorYellow
-				infoStr = "空闲"
+				infoStr = "未启动"
 			default:
 				statusIcon = "?"
 				statusColor = colorGray
@@ -206,6 +206,11 @@ func printNode(node *InterfaceNode, prefix string, isLast bool) {
 		// 显示IP地址
 		if iface.IP != "" {
 			infoStr = fmt.Sprintf("%s | IP: %s%s%s", infoStr, colorBrightCyan, iface.IP, colorReset)
+		}
+
+		// 显示成本
+		if iface.Cost > 0 {
+			infoStr = fmt.Sprintf("%s | Cost: %s%d%s", infoStr, colorYellow, iface.Cost, colorReset)
 		}
 	} else {
 		// 隧道接口
@@ -230,7 +235,7 @@ func printNode(node *InterfaceNode, prefix string, isLast bool) {
 			case "IDLE":
 				statusIcon = "○"
 				statusColor = colorYellow
-				infoStr = "空闲"
+				infoStr = "未启动"
 			default:
 				statusIcon = "?"
 				statusColor = colorGray
@@ -248,6 +253,11 @@ func printNode(node *InterfaceNode, prefix string, isLast bool) {
 		}
 		if tunnel.RemoteVIP != "" {
 			infoStr = fmt.Sprintf("%s, VIP: %s%s%s", infoStr, colorCyan, tunnel.RemoteVIP, colorReset)
+		}
+
+		// 显示成本
+		if tunnel.Cost > 0 {
+			infoStr = fmt.Sprintf("%s | Cost: %s%d%s", infoStr, colorYellow, tunnel.Cost, colorReset)
 		}
 	}
 

@@ -895,13 +895,16 @@ type ExitScore struct {
 	Name        string
 	Latency     float64
 	PacketLoss  float64
-	Score       float64
+	BaseScore   float64 // 基础评分 (丢包+延迟)
+	Cost        int     // 成本 (0-100)
+	CostPenalty float64 // 成本惩罚
+	Score       float64 // 最终评分 = 基础评分 - 成本惩罚
 	Available   bool
 	Reason      string
 }
 
-// calculateScore 计算出口评分
-func calculateScore(latency, packetLoss float64) float64 {
+// calculateBaseScore 计算基础评分（不含成本）
+func calculateBaseScore(latency, packetLoss float64) float64 {
 	var score float64
 
 	// 丢包率评分（0-60分）
@@ -935,6 +938,20 @@ func calculateScore(latency, packetLoss float64) float64 {
 	return score
 }
 
+// calculateFinalScore 计算最终评分（基础评分 - 成本惩罚）
+func calculateFinalScore(baseScore float64, cost int) (float64, float64) {
+	// 成本惩罚 = cost * 0.5
+	costPenalty := float64(cost) * 0.5
+	finalScore := baseScore - costPenalty
+
+	// 确保最终评分不为负数
+	if finalScore < 0 {
+		finalScore = 0
+	}
+
+	return finalScore, costPenalty
+}
+
 // SelectBestExit 从候选出口中选择最佳出口
 func SelectBestExit(candidates []string, checkResults *network.AllCheckResults) (*ExitScore, []*ExitScore, error) {
 	if len(candidates) == 0 {
@@ -965,10 +982,15 @@ func SelectBestExit(candidates []string, checkResults *network.AllCheckResults) 
 			continue
 		}
 
+		// 获取出口成本
+		cost := getExitCost(candidate)
+
 		// 计算评分
 		exitScore.Latency = result.Latency
 		exitScore.PacketLoss = result.PacketLoss
-		exitScore.Score = calculateScore(result.Latency, result.PacketLoss)
+		exitScore.Cost = cost
+		exitScore.BaseScore = calculateBaseScore(result.Latency, result.PacketLoss)
+		exitScore.Score, exitScore.CostPenalty = calculateFinalScore(exitScore.BaseScore, cost)
 		exitScore.Available = true
 
 		scores = append(scores, exitScore)
@@ -989,6 +1011,27 @@ func SelectBestExit(candidates []string, checkResults *network.AllCheckResults) 
 	}
 
 	return bestExit, scores, nil
+}
+
+// getExitCost 获取出口的成本值
+func getExitCost(exitName string) int {
+	// 先尝试作为隧道加载
+	tunnelConfig, err := network.LoadTunnelConfig(exitName)
+	if err == nil && tunnelConfig != nil {
+		return tunnelConfig.Cost
+	}
+
+	// 再尝试作为物理接口加载
+	ifaceConfig, err := network.LoadInterfaceConfig()
+	if err == nil {
+		iface := ifaceConfig.GetInterfaceByName(exitName)
+		if iface != nil {
+			return iface.Cost
+		}
+	}
+
+	// 默认成本为0
+	return 0
 }
 
 // checkCandidates 检查候选出口连通性并保存结果
@@ -1042,8 +1085,16 @@ func printScores(scores []*ExitScore, bestExit *ExitScore) {
 			if bestExit != nil && score.Name == bestExit.Name {
 				best = " \033[93m★ 最佳\033[0m"
 			}
-			fmt.Printf("  \033[1m%-10s\033[0m | 延迟: \033[96m%-8.1fms\033[0m 丢包率: \033[96m%-6.0f%%\033[0m | 评分: \033[92m%.1f\033[0m%s\n",
-				score.Name, score.Latency, score.PacketLoss, score.Score, best)
+
+			// 显示详细评分信息：基础评分、成本、成本惩罚、最终评分
+			if score.Cost > 0 {
+				fmt.Printf("  \033[1m%-10s\033[0m | 延迟: \033[96m%-8.1fms\033[0m 丢包: \033[96m%-5.0f%%\033[0m | 基础评分: \033[94m%.1f\033[0m Cost: \033[33m%d\033[0m 惩罚: \033[91m-%.1f\033[0m → 最终: \033[92m%.1f\033[0m%s\n",
+					score.Name, score.Latency, score.PacketLoss, score.BaseScore, score.Cost, score.CostPenalty, score.Score, best)
+			} else {
+				// 成本为0时,简化显示
+				fmt.Printf("  \033[1m%-10s\033[0m | 延迟: \033[96m%-8.1fms\033[0m 丢包: \033[96m%-5.0f%%\033[0m | 基础评分: \033[94m%.1f\033[0m Cost: \033[33m%d\033[0m → 最终: \033[92m%.1f\033[0m%s\n",
+					score.Name, score.Latency, score.PacketLoss, score.BaseScore, score.Cost, score.Score, best)
+			}
 		} else {
 			fmt.Printf("  \033[1m%-10s\033[0m | 状态: \033[90m%-25s\033[0m | 不可用\n",
 				score.Name, score.Reason)
