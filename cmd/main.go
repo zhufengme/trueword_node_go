@@ -23,7 +23,7 @@ import (
 
 const (
 	// 版本信息
-	Version = "1.1"
+	Version = "1.2"
 )
 
 var (

@@ -6,14 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
 
-**当前版本**：v1.1
+**当前版本**：v1.2
 
 **最新特性**：
 - 策略组优先级自定义（手动指定或自动分配）
 - 优先级调整命令（`policy set-priority`）
+- 优先级冲突检测和验证
 - 成本（Cost）机制用于故障转移评分
 - 优化的连通性检查（5% 丢包率精度，4秒测试时间）
-- 使用 tablewriter 库的美观表格显示
+- 使用 tablewriter 库的美观表格显示（完美处理中英文对齐）
+- 策略组列表按优先级排序显示
 
 ## 构建命令
 
