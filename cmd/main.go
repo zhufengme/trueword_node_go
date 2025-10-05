@@ -729,7 +729,7 @@ func main() {
 	policyCreateCmd := &cobra.Command{
 		Use:   "create <group_name> <exit_interface>",
 		Short: "创建策略组",
-		Long:  "创建策略组，优先级自动分配。出口可以是物理接口、隧道或第三方接口(OpenVPN/WireGuard等)\n可选参数 --from 指定源地址限制（接口名/CIDR/IP，默认all）",
+		Long:  "创建策略组，优先级自动分配或手动指定。出口可以是物理接口、隧道或第三方接口(OpenVPN/WireGuard等)\n可选参数 --from 指定源地址限制（接口名/CIDR/IP，默认all）\n可选参数 --priority 手动指定优先级（100-899，默认自动分配）",
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			pm = routing.NewPolicyManager()
@@ -737,29 +737,58 @@ func main() {
 			// 获取 --from 参数
 			fromInput, _ := cmd.Flags().GetString("from")
 
-			// 加载现有策略组,找到最大优先级
-			maxPrio := routing.PrioUserPolicyBase - 1
+			// 获取 --priority 参数
+			priorityInput, _ := cmd.Flags().GetInt("priority")
+
+			var newPrio int
+
+			// 加载所有现有策略组（用于检查优先级冲突）
+			existingGroups := make(map[int]string) // priority -> group_name
 			entries, err := os.ReadDir(routing.PolicyDir)
 			if err == nil {
 				for _, entry := range entries {
 					if strings.HasSuffix(entry.Name(), ".policy") {
 						groupName := strings.TrimSuffix(entry.Name(), ".policy")
 						if err := pm.LoadGroup(groupName); err == nil {
-							// 获取该组优先级(临时访问)
 							group := pm.GetGroup(groupName)
-							if group != nil && group.Priority > maxPrio {
-								maxPrio = group.Priority
+							if group != nil {
+								existingGroups[group.Priority] = groupName
 							}
 						}
 					}
 				}
 			}
 
-			// 分配新优先级
-			newPrio := maxPrio + 1
-			if newPrio >= routing.PrioDefault {
-				fmt.Fprintf(os.Stderr, "错误: 策略组数量已达上限\n")
-				os.Exit(1)
+			if priorityInput > 0 {
+				// 用户指定了优先级，检查是否合法且不冲突
+				if priorityInput < routing.PrioUserPolicyBase || priorityInput >= routing.PrioDefault {
+					fmt.Fprintf(os.Stderr, "错误: 优先级必须在 %d-%d 之间\n", routing.PrioUserPolicyBase, routing.PrioDefault-1)
+					os.Exit(1)
+				}
+
+				// 检查优先级是否已被使用
+				if existingGroup, exists := existingGroups[priorityInput]; exists {
+					fmt.Fprintf(os.Stderr, "错误: 优先级 %d 已被策略组 '%s' 使用\n", priorityInput, existingGroup)
+					os.Exit(1)
+				}
+
+				newPrio = priorityInput
+				fmt.Printf("使用指定优先级: %d\n", newPrio)
+			} else {
+				// 自动分配优先级，找到最大优先级
+				maxPrio := routing.PrioUserPolicyBase - 1
+				for prio := range existingGroups {
+					if prio > maxPrio {
+						maxPrio = prio
+					}
+				}
+
+				newPrio = maxPrio + 1
+				if newPrio >= routing.PrioDefault {
+					fmt.Fprintf(os.Stderr, "错误: 策略组数量已达上限\n")
+					os.Exit(1)
+				}
+				fmt.Printf("自动分配优先级: %d\n", newPrio)
 			}
 
 			if err := pm.CreateGroup(args[0], args[1], newPrio, fromInput); err != nil {
@@ -776,8 +805,9 @@ func main() {
 		},
 	}
 
-	// 添加 --from 标志
+	// 添加 --from 和 --priority 标志
 	policyCreateCmd.Flags().String("from", "all", "源地址/源地址段/源接口名（默认all表示所有源）")
+	policyCreateCmd.Flags().Int("priority", 0, "手动指定优先级（100-899，默认0表示自动分配）")
 
 	// 添加CIDR
 	policyAddCmd := &cobra.Command{
@@ -1168,6 +1198,121 @@ func main() {
 		},
 	}
 
+	// 调整策略组优先级命令
+	policySetPriorityCmd := &cobra.Command{
+		Use:   "set-priority <group_name> <priority>",
+		Short: "调整策略组的优先级",
+		Long: "调整策略组的优先级(100-899)，会检查优先级冲突，调整后自动重新应用策略组\n" +
+			"示例: twnode policy set-priority vpn_group 150",
+		Args: cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			groupName := args[0]
+			var newPriority int
+			if _, err := fmt.Sscanf(args[1], "%d", &newPriority); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: 优先级必须是数字\n")
+				os.Exit(1)
+			}
+
+			// 验证优先级范围
+			if newPriority < routing.PrioUserPolicyBase || newPriority >= routing.PrioDefault {
+				fmt.Fprintf(os.Stderr, "错误: 优先级必须在 %d-%d 之间\n", routing.PrioUserPolicyBase, routing.PrioDefault-1)
+				os.Exit(1)
+			}
+
+			pm := routing.NewPolicyManager()
+
+			// 加载目标策略组
+			if err := pm.LoadGroup(groupName); err != nil {
+				fmt.Fprintf(os.Stderr, "加载策略组失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			group := pm.GetGroup(groupName)
+			if group == nil {
+				fmt.Fprintf(os.Stderr, "策略组 %s 不存在\n", groupName)
+				os.Exit(1)
+			}
+
+			oldPriority := group.Priority
+
+			// 如果优先级没变，直接返回
+			if oldPriority == newPriority {
+				fmt.Printf("策略组 %s 的优先级已经是 %d，无需修改\n", groupName, newPriority)
+				return
+			}
+
+			// 加载所有现有策略组（检查优先级冲突）
+			existingGroups := make(map[int]string) // priority -> group_name
+			entries, err := os.ReadDir(routing.PolicyDir)
+			if err == nil {
+				for _, entry := range entries {
+					if strings.HasSuffix(entry.Name(), ".policy") {
+						gName := strings.TrimSuffix(entry.Name(), ".policy")
+						if gName == groupName {
+							continue // 跳过当前策略组
+						}
+						if err := pm.LoadGroup(gName); err == nil {
+							g := pm.GetGroup(gName)
+							if g != nil {
+								existingGroups[g.Priority] = gName
+							}
+						}
+					}
+				}
+			}
+
+			// 检查新优先级是否已被使用
+			if conflictGroup, exists := existingGroups[newPriority]; exists {
+				fmt.Fprintf(os.Stderr, "错误: 优先级 %d 已被策略组 '%s' 使用\n", newPriority, conflictGroup)
+				os.Exit(1)
+			}
+
+			fmt.Printf("调整策略组 '%s' 优先级: %d -> %d\n", groupName, oldPriority, newPriority)
+
+			// 检查策略组是否已应用（通过检查内核中的规则）
+			checkCmd := fmt.Sprintf("ip rule show pref %d", oldPriority)
+			output, err := exec.Command("sh", "-c", checkCmd).CombinedOutput()
+			isApplied := err == nil && len(output) > 0 && strings.Contains(string(output), fmt.Sprintf("%d:", oldPriority))
+
+			if isApplied {
+				fmt.Println("策略组已应用，先撤销旧配置...")
+				// 撤销旧优先级的规则
+				delCmd := fmt.Sprintf("ip rule del pref %d", oldPriority)
+				exec.Command("sh", "-c", delCmd).Run()
+
+				// 清空旧路由表
+				flushCmd := fmt.Sprintf("ip route flush table %d", oldPriority)
+				exec.Command("sh", "-c", flushCmd).Run()
+			}
+
+			// 更新优先级
+			group.Priority = newPriority
+
+			// 保存配置
+			if err := pm.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✓ 优先级已更新并保存\n")
+
+			// 如果策略组之前已应用，重新应用
+			if isApplied {
+				fmt.Println("\n重新应用策略组...")
+				if err := pm.ApplyGroup(group); err != nil {
+					fmt.Fprintf(os.Stderr, "应用策略组失败: %v\n", err)
+					os.Exit(1)
+				}
+
+				// 刷新路由缓存
+				exec.Command("ip", "route", "flush", "cache").Run()
+
+				fmt.Printf("✓ 策略组 '%s' 已重新应用 (优先级: %d)\n", groupName, newPriority)
+			} else {
+				fmt.Printf("✓ 策略组 '%s' 优先级已调整 (优先级: %d)，运行 'twnode policy apply' 以应用\n", groupName, newPriority)
+			}
+		},
+	}
+
 	// 删除策略组命令
 	policyDeleteCmd := &cobra.Command{
 		Use:   "delete <group_name>",
@@ -1190,7 +1335,7 @@ func main() {
 
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
-		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policyDeleteCmd)
+		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policySetPriorityCmd, policyDeleteCmd)
 
 	// 版本命令
 	versionCmd := &cobra.Command{

@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/olekukonko/tablewriter"
 	"github.com/vishvananda/netlink"
 	"trueword_node/pkg/network"
 )
@@ -744,13 +746,61 @@ func (pm *PolicyManager) ListGroups() {
 		return
 	}
 
-	fmt.Println("策略组列表:")
-	for _, group := range pm.groups {
-		fmt.Printf("\n  组名: %s\n", group.Name)
-		fmt.Printf("  出口: %s\n", group.Exit)
-		fmt.Printf("  优先级: %d\n", group.Priority)
-		fmt.Printf("  CIDR数量: %d\n", len(group.CIDRs))
+	// 转换为切片以便排序
+	type groupInfo struct {
+		name     string
+		priority int
+		exit     string
+		cidrNum  int
+		from     string
 	}
+
+	groupList := make([]groupInfo, 0, len(pm.groups))
+	for _, group := range pm.groups {
+		fromStr := group.From
+		if fromStr == "" || fromStr == "all" {
+			fromStr = "all"
+		}
+		groupList = append(groupList, groupInfo{
+			name:     group.Name,
+			priority: group.Priority,
+			exit:     group.Exit,
+			cidrNum:  len(group.CIDRs),
+			from:     fromStr,
+		})
+	}
+
+	// 按优先级从高到低排序（数字小的优先级高）
+	for i := 0; i < len(groupList)-1; i++ {
+		for j := i + 1; j < len(groupList); j++ {
+			if groupList[i].priority > groupList[j].priority {
+				groupList[i], groupList[j] = groupList[j], groupList[i]
+			}
+		}
+	}
+
+	// 使用 tablewriter 打印表格
+	fmt.Println()
+	fmt.Println("策略组列表:")
+	fmt.Println()
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.Header("组名", "优先级", "出口", "CIDR数量", "源限制")
+
+	for _, g := range groupList {
+		table.Append(
+			g.name,
+			strconv.Itoa(g.priority),
+			g.exit,
+			strconv.Itoa(g.cidrNum),
+			g.from,
+		)
+	}
+
+	table.Render()
+
+	fmt.Println()
+	fmt.Printf("共 %d 个策略组\n", len(groupList))
 }
 
 // 工具函数
