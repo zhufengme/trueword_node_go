@@ -6,30 +6,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
 
+**当前版本**：v1.1
+
+**最新特性**：
+- 策略组优先级自定义（手动指定或自动分配）
+- 优先级调整命令（`policy set-priority`）
+- 成本（Cost）机制用于故障转移评分
+- 优化的连通性检查（5% 丢包率精度，4秒测试时间）
+- 使用 tablewriter 库的美观表格显示
+
 ## 构建命令
 
-```bash
-# 动态链接构建
-make build
-# 或直接: go build -o bin/twnode cmd/main.go
+**重要：始终使用静态编译，确保二进制文件可在任何 Linux 系统上运行**
 
-# 静态编译（生产环境推荐）
+```bash
+# 静态编译（推荐，默认方式）
 make static
+# 生成: bin/twnode (静态链接，无依赖)
+
+# 验证静态编译
+file bin/twnode          # 应显示 "statically linked"
+ldd bin/twnode           # 应显示 "not a dynamic executable"
 
 # 安装到系统
 sudo make install
 
-# 格式化代码
-make fmt
-
-# 代码检查
-make vet
-
-# 运行测试
-make test
-
-# 清理构建产物
-make clean
+# 开发辅助命令
+make fmt                 # 格式化代码
+make vet                 # 代码检查
+make test                # 运行测试
+make clean               # 清理构建产物
 ```
 
 ## 核心架构
@@ -86,11 +92,14 @@ make clean
 - 优先级规则：`ip rule add from all lookup 80 pref 80`
 
 **策略路由优先级设计**：
+- **5**: 临时测试路由（check 和 failover 使用，执行后立即清理）
 - **10**: 系统保护路由（保护隧道底层连接，防止路由环路）
-- **100-899**: 用户策略组（自动递增分配）
+- **100-899**: 用户策略组（支持自动分配或手动指定）
 - **900**: 默认路由 (0.0.0.0/0 兜底路由，可选)
 - **32766**: 主路由表
 - **32767**: 系统默认路由表
+
+**注意**：优先级 5 的临时测试路由优先级最高，确保测试流量不受用户策略干扰，但仅在测试期间存在（通过 defer 清理）
 
 ### 4. 撤销机制（Rev Commands）
 
@@ -170,8 +179,27 @@ twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunn
 - 撤销：`twnode policy revoke` 或 `twnode policy revoke <group_name>`
 - 删除：`twnode policy delete <group_name>`（自动检测并撤销已应用的策略）
 
+**创建策略组**：
+```bash
+# 自动分配优先级（默认）
+twnode policy create <group_name> <exit_interface>
+
+# 手动指定优先级（100-899）
+twnode policy create <group_name> <exit_interface> --priority 150
+
+# 可选的源地址限制
+twnode policy create <group_name> <exit_interface> --from <source_ip/cidr>
+```
+
+**调整优先级**：
+```bash
+# 修改已存在策略组的优先级
+twnode policy set-priority <group_name> <new_priority>
+# 会自动检查优先级冲突，如已应用则自动重新应用
+```
+
 **应用流程**：
-1. 创建策略组（指定出口接口和可选的 from 源地址限制）
+1. 创建策略组（指定出口接口、可选优先级和 from 源地址限制）
 2. 添加 CIDR 到策略组
 3. **Apply** 时检查出口接口状态
 4. 自动添加保护路由（优先级10，保护隧道底层连接）
@@ -181,7 +209,9 @@ twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunn
 **故障转移（Failover）流程**：
 1. 指定策略组或默认路由及候选出口列表
 2. 可选：提供 check_ip 重新检查，或使用 `line check` 的历史结果
-3. 根据评分算法（60% 丢包率 + 40% 延迟）选择最佳出口
+3. 根据评分算法（基础评分 - 成本惩罚）选择最佳出口
+   - 基础评分 = 60% 丢包率评分 + 40% 延迟评分
+   - 成本惩罚 = Cost × 0.5
 4. 自动切换策略组或默认路由到最佳出口
 
 实现：`pkg/routing/policy.go`
@@ -249,10 +279,25 @@ ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由
 - 使用 `network.SaveCheckResults()` 保存结果
 - Failover 功能依赖这些检查结果
 
-**评分算法**：
-- 丢包率评分：0-60 分（用户对丢包更敏感）
-- 延迟评分：0-40 分
-- 总分：0-100 分，分数越高越好
+**Ping 测试优化**（v1.1+）：
+- 发送 20 个 ping 包（提供 5% 丢包率精度）
+- 包间隔 `-i 0.2` 秒（加速测试）
+- 超时 `-W 1` 秒
+- 总测试时间：约 4 秒
+
+**临时测试路由**：
+- 优先级 5（最高优先级，确保不受用户策略干扰）
+- 规则：`to <目标IP> lookup 5 pref 5`
+- 使用 defer 确保测试完成后立即清理
+- 测试期间可能短暂影响访问目标IP的流量（约4秒）
+
+**评分算法（v1.1+）**：
+- 基础评分（0-100分）：
+  - 丢包率评分：0-60 分（权重更高）
+  - 延迟评分：0-40 分
+- 成本惩罚：Cost × 0.5
+- 最终评分 = 基础评分 - 成本惩罚
+- 分数越高越好，用于 failover 选择最佳出口
 
 ## UI 设计原则
 
@@ -263,7 +308,15 @@ ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由
 - 使用图标增强可读性（✓ ✗ ⚠️）
 - 保持输出简洁、美观、易读
 
-实现示例：`pkg/ipsec/tunnel.go` 中的 `execCommand()` 函数
+**表格显示**：
+- **始终使用 tablewriter 库**处理表格显示
+- 自动处理中英文字符对齐问题
+- 提供美观的 ASCII 边框
+- 库：`github.com/olekukonko/tablewriter`
+
+实现示例：
+- 命令执行：`pkg/ipsec/tunnel.go` 中的 `execCommand()` 函数
+- 表格显示：`pkg/routing/policy.go` 中的 `ListGroups()` 函数
 
 ## 常见开发任务
 
@@ -279,8 +332,10 @@ ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由
 1. 在 `pkg/routing/policy.go` 中添加逻辑
 2. **注意策略规则管理**：必须使用"先添加后清理"的策略避免网络中断
 3. 注意优先级范围限制（100-899 为用户策略组范围）
-4. 在 `cmd/main.go` 中添加子命令
-5. 考虑是否需要支持局部操作（单个策略组 vs 所有策略）
+4. 优先级冲突检查：创建或修改优先级时检查是否与其他策略组冲突
+5. 在 `cmd/main.go` 中添加子命令
+6. 考虑是否需要支持局部操作（单个策略组 vs 所有策略）
+7. 如果涉及表格显示，使用 tablewriter 库
 
 ### 修改物理接口扫描逻辑
 
@@ -303,6 +358,7 @@ ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由
 require (
     github.com/spf13/cobra              // CLI 框架
     github.com/vishvananda/netlink      // 网络接口管理
+    github.com/olekukonko/tablewriter   // 表格显示（处理中英文对齐）
     gopkg.in/yaml.v3                    // 配置文件解析
 )
 ```
@@ -314,12 +370,25 @@ require (
 - 测试前运行 `sudo twnode init` 初始化环境
 - 清理测试环境：删除测试隧道，运行 `twnode policy revoke`
 
-## 语言和文档
+## 开发规范
 
+### 语言和文档
 - **代码注释**：使用简体中文
 - **CLI 输出**：使用简体中文
 - **用户交互**：使用简体中文
 - **变量命名**：使用英文
-- 请你不要在修改完成后自动的帮我commit和push，除非我明确告诉你
-- 以后请坚持用tablewriter 库来解决表格显示问题
-- 请始终静态编译，以便在任何系统上都能运行二进制文件
+
+### Git 工作流
+- **不要自动 commit 和 push**，除非用户明确要求
+- 创建 commit 时使用有意义的中文提交信息
+- 提交信息格式：简短标题 + 详细说明（新增功能、修复问题、技术改进）
+
+### 编译和构建
+- **始终使用静态编译**（`make static`）
+- 确保二进制文件可在任何 Linux 系统上运行
+- 编译后验证静态链接（`file` 和 `ldd`）
+
+### UI 和显示
+- **表格显示必须使用 tablewriter 库**
+- 自动处理中英文字符对齐
+- 保持输出简洁美观
