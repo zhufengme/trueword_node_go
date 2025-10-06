@@ -243,7 +243,7 @@ func (t *Tunnel) Create() error {
 
 	// 记录撤销命令
 	revCommands := []string{
-		fmt.Sprintf("ip link set %s down", t.Name),
+		fmt.Sprintf("ip link set dev %s down", t.Name),
 		fmt.Sprintf("ip tunnel del %s mode gre remote %s local %s key %d ttl 255", t.Name, t.RemoteIP, t.LocalIP, t.GREKey),
 		fmt.Sprintf("ip addr del %s/32 dev %s", t.LocalVirtualIP, t.Name),
 		fmt.Sprintf("ip route del %s/32 dev %s table 80", t.RemoteVirtualIP, t.Name),
@@ -264,7 +264,7 @@ func (t *Tunnel) Create() error {
 	}
 
 	// 启动接口
-	cmd = fmt.Sprintf("ip link set %s up mtu 1400", t.Name)
+	cmd = fmt.Sprintf("ip link set dev %s up mtu 1400", t.Name)
 	if err := execCommand(cmd); err != nil {
 		return err
 	}

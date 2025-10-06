@@ -215,7 +215,19 @@ func printNode(node *InterfaceNode, prefix string, isLast bool) {
 	} else {
 		// 隧道接口
 		tunnel := node.Config.(*network.TunnelConfig)
-		typeStr = "隧道"
+
+		// 根据隧道类型显示不同的类型标识
+		if tunnel.TunnelType == "wireguard" {
+			typeStr = "WireGuard"
+			// 添加模式标识
+			if tunnel.WGMode == "server" {
+				typeStr += "/服务端"
+			} else if tunnel.WGMode == "client" {
+				typeStr += "/客户端"
+			}
+		} else {
+			typeStr = "IPsec"
+		}
 		typeColor = colorMagenta
 
 		if !tunnel.Enabled {

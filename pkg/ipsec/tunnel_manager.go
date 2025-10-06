@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"trueword_node/pkg/network"
+	"trueword_node/pkg/wireguard"
 
 	"github.com/vishvananda/netlink"
 )
@@ -177,8 +178,21 @@ func removePolicyRoute(remoteIP, parentInterface string) error {
 	return nil
 }
 
-// Create 创建隧道(包括IPsec和GRE)
+// Create 创建隧道(根据类型分发到IPsec或WireGuard)
 func (tm *TunnelManager) Create() error {
+	cfg := tm.config
+
+	// 根据隧道类型分发
+	if cfg.TunnelType == "wireguard" {
+		return tm.createWireGuardTunnel()
+	}
+
+	// 默认创建 IPsec 隧道
+	return tm.createIPsecTunnel()
+}
+
+// createIPsecTunnel 创建 IPsec 隧道(原有逻辑)
+func (tm *TunnelManager) createIPsecTunnel() error {
 	cfg := tm.config
 
 	// 显示创建信息
@@ -274,6 +288,102 @@ func (tm *TunnelManager) Create() error {
 	return nil
 }
 
+// createWireGuardTunnel 创建 WireGuard 隧道
+func (tm *TunnelManager) createWireGuardTunnel() error {
+	cfg := tm.config
+
+	// 显示创建信息
+	fmt.Println()
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Printf("║  创建隧道: %-48s║\n", cfg.Name)
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	// 1. 验证父接口
+	if err := network.ValidateParentInterface(cfg.ParentInterface); err != nil {
+		return fmt.Errorf("❌ 父接口验证失败: %w", err)
+	}
+
+	// 2. 如果未指定本地IP,从父接口获取
+	if cfg.LocalIP == "" {
+		localIP, err := getLocalIPFromParent(cfg.ParentInterface)
+		if err != nil {
+			return err
+		}
+		cfg.LocalIP = localIP
+	}
+
+	// 3. 获取网关(用于策略路由)
+	gateway, _ := getGatewayFromParent(cfg.ParentInterface)
+
+	// 显示配置信息
+	fmt.Println("【配置信息】")
+	fmt.Printf("  父接口:     %s\n", cfg.ParentInterface)
+	fmt.Printf("  本地IP:     %s (自动获取)\n", cfg.LocalIP)
+	if gateway != "" {
+		fmt.Printf("  网关:       %s\n", gateway)
+	}
+	if cfg.WGMode == "client" {
+		// 客户端模式显示远程IP
+		fmt.Printf("  远程IP:     %s\n", cfg.RemoteIP)
+	}
+	fmt.Printf("  本地VIP:    %s\n", cfg.LocalVIP)
+	fmt.Printf("  远程VIP:    %s\n", cfg.RemoteVIP)
+	fmt.Printf("  类型:       WireGuard (%s模式)\n", cfg.WGMode)
+	if cfg.ListenPort > 0 {
+		fmt.Printf("  监听端口:   %d\n", cfg.ListenPort)
+	} else {
+		fmt.Printf("  监听端口:   自动分配\n")
+	}
+	fmt.Println()
+
+	// 4. 设置策略路由(确保远程IP通过正确的物理接口)
+	fmt.Println("【建立连接】")
+	// WireGuard 服务端模式不需要策略路由（RemoteIP 为 0.0.0.0）
+	if cfg.RemoteIP != "0.0.0.0" {
+		if err := setupPolicyRoute(cfg.RemoteIP, cfg.ParentInterface, gateway); err != nil {
+			return fmt.Errorf("❌ 设置策略路由失败: %w", err)
+		}
+	} else {
+		fmt.Printf("   ✓ 策略路由: 跳过 (服务端模式)\n")
+	}
+
+	// 5. 创建 WireGuard 隧道
+	wgTunnel := &wireguard.WireGuardTunnel{
+		Name:           cfg.Name,
+		Mode:           cfg.WGMode,
+		LocalIP:        cfg.LocalIP,
+		RemoteIP:       cfg.RemoteIP,
+		LocalVIP:       cfg.LocalVIP,
+		RemoteVIP:      cfg.RemoteVIP,
+		PrivateKey:     cfg.PrivateKey,
+		PeerPublicKey:  cfg.PeerPublicKey,
+		ListenPort:     cfg.ListenPort,
+		PeerListenPort: cfg.PeerListenPort,
+	}
+
+	if err := wgTunnel.Create(); err != nil {
+		removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+		return fmt.Errorf("❌ 创建WireGuard隧道失败: %w", err)
+	}
+
+	// 6. 保存配置
+	if err := network.SaveTunnelConfig(cfg); err != nil {
+		fmt.Printf("   ⚠️  配置保存失败: %v\n", err)
+	} else {
+		fmt.Printf("   ✓ 配置已保存\n")
+	}
+
+	// 成功提示
+	fmt.Println()
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Printf("║  ✓ 隧道 %-49s 创建成功! ║\n", cfg.Name)
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	return nil
+}
+
 // Remove 删除隧道
 func (tm *TunnelManager) Remove() error {
 	cfg := tm.config
@@ -281,24 +391,34 @@ func (tm *TunnelManager) Remove() error {
 	fmt.Println()
 	fmt.Printf("正在删除隧道: %s\n", cfg.Name)
 
-	// 1. 删除GRE隧道
-	if err := RemoveTunnel(cfg.Name); err != nil {
-		fmt.Printf("   ⚠️  删除GRE隧道失败: %v\n", err)
-	}
+	// 根据类型删除隧道
+	if cfg.TunnelType == "wireguard" {
+		// 删除 WireGuard 隧道
+		if err := wireguard.RemoveTunnel(cfg.Name); err != nil {
+			fmt.Printf("   ⚠️  删除WireGuard隧道失败: %v\n", err)
+		}
+	} else {
+		// 删除 GRE 隧道
+		if err := RemoveTunnel(cfg.Name); err != nil {
+			fmt.Printf("   ⚠️  删除GRE隧道失败: %v\n", err)
+		}
 
-	// 2. 删除IPsec连接(如果启用了加密)
-	if cfg.UseEncryption {
-		if err := RemoveIPsec(cfg.LocalIP, cfg.RemoteIP); err != nil {
-			fmt.Printf("   ⚠️  删除IPsec失败: %v\n", err)
+		// 删除IPsec连接(如果启用了加密)
+		if cfg.UseEncryption {
+			if err := RemoveIPsec(cfg.LocalIP, cfg.RemoteIP); err != nil {
+				fmt.Printf("   ⚠️  删除IPsec失败: %v\n", err)
+			}
 		}
 	}
 
-	// 3. 删除策略路由
-	if err := removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface); err != nil {
-		fmt.Printf("   ⚠️  删除策略路由失败: %v\n", err)
+	// 删除策略路由（WireGuard 服务端模式无需删除）
+	if cfg.RemoteIP != "0.0.0.0" {
+		if err := removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface); err != nil {
+			fmt.Printf("   ⚠️  删除策略路由失败: %v\n", err)
+		}
 	}
 
-	// 4. 删除配置文件
+	// 删除配置文件
 	if err := network.DeleteTunnelConfig(cfg.Name); err != nil {
 		fmt.Printf("   ⚠️  删除配置文件失败: %v\n", err)
 	} else {

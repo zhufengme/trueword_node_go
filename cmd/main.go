@@ -19,6 +19,7 @@ import (
 	"trueword_node/pkg/network"
 	"trueword_node/pkg/routing"
 	"trueword_node/pkg/system"
+	"trueword_node/pkg/wireguard"
 )
 
 const (
@@ -48,12 +49,50 @@ func readPassword(prompt string) string {
 	return strings.TrimSpace(string(password))
 }
 
+// checkWireGuardInstalled 检查 WireGuard 是否安装
+func checkWireGuardInstalled() error {
+	return wireguard.CheckWireGuardInstalled()
+}
+
+// generateWireGuardKeys 生成 WireGuard 密钥对
+func generateWireGuardKeys() (privateKey, publicKey string, err error) {
+	return wireguard.GenerateKeyPair()
+}
+
+// generatePeerCommand 生成对端配置命令
+func generatePeerCommand(config *network.TunnelConfig, peerPrivateKey, peerPublicKey string) string {
+	return wireguard.GeneratePeerCommand(config, peerPrivateKey, peerPublicKey)
+}
+
+// savePeerConfig 保存对端配置到文件
+func savePeerConfig(tunnelName, content string) error {
+	return wireguard.SavePeerConfig(tunnelName, content)
+}
+
 // 交互式创建隧道
 func interactiveCreateLine() error {
 	fmt.Println("=== 交互式创建隧道 ===\n")
 
-	// 1. 列出可用的父接口
-	fmt.Println("正在扫描可用的父接口...")
+	// 1. 选择隧道类型
+	fmt.Println("选择隧道类型:")
+	fmt.Println("[1] GRE over IPsec")
+	fmt.Println("[2] WireGuard")
+
+	var tunnelType string
+	for {
+		choice := readInput("\n选择 (1 或 2): ")
+		if choice == "1" {
+			tunnelType = "ipsec"
+			break
+		} else if choice == "2" {
+			tunnelType = "wireguard"
+			break
+		}
+		fmt.Println("无效的选择，请输入 1 或 2")
+	}
+
+	// 2. 列出可用的父接口
+	fmt.Println("\n正在扫描可用的父接口...")
 	parents, err := network.ListAvailableParentInterfaces()
 	if err != nil {
 		return fmt.Errorf("获取父接口失败: %w", err)
@@ -70,7 +109,7 @@ func interactiveCreateLine() error {
 	}
 	fmt.Println(strings.Repeat("-", 60))
 
-	// 2. 选择父接口
+	// 3. 选择父接口
 	var parentInterface string
 	for {
 		choice := readInput("\n选择父接口 (输入编号或名称): ")
@@ -105,44 +144,38 @@ func interactiveCreateLine() error {
 
 	fmt.Printf("已选择父接口: %s\n", parentInterface)
 
-	// 3. 输入远程IP
+	if tunnelType == "wireguard" {
+		// WireGuard 特有流程：先选择模式，再决定是否需要远程IP
+		return interactiveCreateWireGuardWithMode(parentInterface)
+	}
+
+	// IPsec 流程：需要远程IP
+	// 4. 输入远程IP
 	remoteIP := readInput("\n远程IP地址: ")
 	if remoteIP == "" {
 		return fmt.Errorf("远程IP不能为空")
 	}
 
-	// 4. 输入远程虚拟IP
+	// 5. 输入远程虚拟IP
 	remoteVIP := readInput("远程虚拟IP: ")
 	if remoteVIP == "" {
 		return fmt.Errorf("远程虚拟IP不能为空")
 	}
 
-	// 5. 输入本地虚拟IP (注意: 不是本地IP!)
+	// 6. 输入本地虚拟IP
 	localVIP := readInput("本地虚拟IP: ")
 	if localVIP == "" {
 		return fmt.Errorf("本地虚拟IP不能为空")
 	}
 
-	// 6. 输入隧道名
+	// 7. 输入隧道名
 	tunnelName := readInput("隧道名称 (留空自动生成): ")
 	if tunnelName == "" {
 		tunnelName = fmt.Sprintf("tun-%d", rand.Intn(9000)+1000)
 		fmt.Printf("自动生成隧道名: %s\n", tunnelName)
 	}
 
-	// 7. 输入认证密钥
-	authPass := readInput("认证密钥: ")
-	if authPass == "" {
-		return fmt.Errorf("认证密钥不能为空")
-	}
-
-	// 8. 输入加密密钥
-	encPass := readInput("加密密钥: ")
-	if encPass == "" {
-		return fmt.Errorf("加密密钥不能为空")
-	}
-
-	// 9.5. 输入成本值
+	// 8. 输入成本值
 	var cost int
 	costInput := readInput("成本值 (0-100, 默认0, 直接回车跳过): ")
 	if costInput != "" {
@@ -154,16 +187,35 @@ func interactiveCreateLine() error {
 		}
 	}
 
-	// 10. 生成密钥
+	// IPsec 原有流程
+	return interactiveCreateIPsec(parentInterface, remoteIP, remoteVIP, localVIP, tunnelName, cost)
+}
+
+// 交互式创建 IPsec 隧道 (原有逻辑)
+func interactiveCreateIPsec(parentInterface, remoteIP, remoteVIP, localVIP, tunnelName string, cost int) error {
+	// 输入认证密钥
+	authPass := readInput("\n认证密钥: ")
+	if authPass == "" {
+		return fmt.Errorf("认证密钥不能为空")
+	}
+
+	// 输入加密密钥
+	encPass := readInput("加密密钥: ")
+	if encPass == "" {
+		return fmt.Errorf("加密密钥不能为空")
+	}
+
+	// 生成密钥
 	authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
 	if err != nil {
 		return err
 	}
 
-	// 11. 确认信息
+	// 确认信息
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("=== 确认信息 ===")
 	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("类型:        GRE over IPsec\n")
 	fmt.Printf("父接口:      %s\n", parentInterface)
 	fmt.Printf("远程IP:      %s\n", remoteIP)
 	fmt.Printf("远程虚拟IP:  %s\n", remoteVIP)
@@ -178,9 +230,10 @@ func interactiveCreateLine() error {
 		return nil
 	}
 
-	// 12. 创建隧道配置
+	// 创建隧道配置
 	tunnelConfig := &network.TunnelConfig{
 		Name:            tunnelName,
+		TunnelType:      "ipsec",
 		ParentInterface: parentInterface,
 		LocalIP:         "", // 自动从父接口获取
 		RemoteIP:        remoteIP,
@@ -190,13 +243,218 @@ func interactiveCreateLine() error {
 		EncKey:          encKey,
 		Cost:            cost,
 		Enabled:         true,
-		UseEncryption:   true, // 默认始终加密
+		UseEncryption:   true,
 	}
 
-	// 13. 使用TunnelManager创建
+	// 使用TunnelManager创建
 	fmt.Println("\n开始创建...")
 	tm := ipsec.NewTunnelManager(tunnelConfig)
 	return tm.Create()
+}
+
+// 交互式创建 WireGuard 隧道（带模式选择）
+func interactiveCreateWireGuardWithMode(parentInterface string) error {
+	// 检查 WireGuard 是否安装
+	if err := checkWireGuardInstalled(); err != nil {
+		return err
+	}
+
+	// 选择运行模式
+	fmt.Println("\nWireGuard 运行模式:")
+	fmt.Println("[1] 服务端模式 (本机有公网IP，等待对端连接)")
+	fmt.Println("[2] 客户端模式 (本机在NAT后，主动连接对端)")
+
+	var wgMode string
+	for {
+		choice := readInput("\n选择 (1 或 2): ")
+		if choice == "1" {
+			wgMode = "server"
+			break
+		} else if choice == "2" {
+			wgMode = "client"
+			break
+		}
+		fmt.Println("无效的选择，请输入 1 或 2")
+	}
+
+	var remoteIP string
+
+	// 根据模式决定是否需要远程IP
+	if wgMode == "server" {
+		// 服务端模式：不需要远程IP（等待客户端连接，不知道客户端IP）
+		remoteIP = "0.0.0.0" // 占位符，表示任意客户端
+		fmt.Println("\n服务端模式：无需指定远程IP，将等待客户端连接")
+	} else {
+		// 客户端模式：需要远程IP（需要主动连接服务端）
+		remoteIP = readInput("\n远程服务端IP地址: ")
+		if remoteIP == "" {
+			return fmt.Errorf("远程IP不能为空")
+		}
+		if net.ParseIP(remoteIP) == nil {
+			return fmt.Errorf("无效的IP地址: %s", remoteIP)
+		}
+	}
+
+	// 输入远程虚拟IP
+	remoteVIP := readInput("\n远程虚拟IP: ")
+	if remoteVIP == "" {
+		return fmt.Errorf("远程虚拟IP不能为空")
+	}
+
+	// 输入本地虚拟IP
+	localVIP := readInput("本地虚拟IP: ")
+	if localVIP == "" {
+		return fmt.Errorf("本地虚拟IP不能为空")
+	}
+
+	// 输入隧道名
+	tunnelName := readInput("隧道名称 (留空自动生成): ")
+	if tunnelName == "" {
+		tunnelName = fmt.Sprintf("wg-%d", rand.Intn(9000)+1000)
+		fmt.Printf("自动生成隧道名: %s\n", tunnelName)
+	}
+
+	// 输入成本值
+	var cost int
+	costInput := readInput("成本值 (0-100, 默认0, 直接回车跳过): ")
+	if costInput != "" {
+		if _, err := fmt.Sscanf(costInput, "%d", &cost); err != nil {
+			return fmt.Errorf("成本值必须是数字: %w", err)
+		}
+		if cost < 0 || cost > 100 {
+			return fmt.Errorf("成本值必须在0-100之间")
+		}
+	}
+
+	var listenPort, peerListenPort int
+
+	if wgMode == "server" {
+		// 服务端模式：需要指定本地监听端口
+		listenPortInput := readInput("\n本地监听端口 (默认51820): ")
+		listenPort = 51820
+		if listenPortInput != "" {
+			if _, err := fmt.Sscanf(listenPortInput, "%d", &listenPort); err != nil {
+				return fmt.Errorf("端口必须是数字: %w", err)
+			}
+			if listenPort < 1 || listenPort > 65535 {
+				return fmt.Errorf("端口必须在1-65535之间")
+			}
+		}
+
+		// 对端监听端口（对端是客户端，自动分配）
+		peerPortInput := readInput("对端监听端口 (默认0，自动分配): ")
+		peerListenPort = 0 // 客户端自动分配
+		if peerPortInput != "" {
+			if _, err := fmt.Sscanf(peerPortInput, "%d", &peerListenPort); err != nil {
+				return fmt.Errorf("端口必须是数字: %w", err)
+			}
+			if peerListenPort < 0 || peerListenPort > 65535 {
+				return fmt.Errorf("端口必须在0-65535之间")
+			}
+		}
+	} else {
+		// 客户端模式：本地端口自动分配，需要知道对端（服务端）监听端口
+		listenPort = 0 // 自动分配
+
+		peerPortInput := readInput("\n对端服务端监听端口: ")
+		if peerPortInput == "" {
+			return fmt.Errorf("对端监听端口不能为空")
+		}
+		if _, err := fmt.Sscanf(peerPortInput, "%d", &peerListenPort); err != nil {
+			return fmt.Errorf("端口必须是数字: %w", err)
+		}
+		if peerListenPort < 1 || peerListenPort > 65535 {
+			return fmt.Errorf("端口必须在1-65535之间")
+		}
+	}
+
+	// 生成密钥对
+	fmt.Println("\n正在生成密钥对...")
+	privKey, pubKey, err := generateWireGuardKeys()
+	if err != nil {
+		return fmt.Errorf("生成密钥失败: %w", err)
+	}
+	fmt.Printf("✓ 本地密钥对已生成\n")
+	fmt.Printf("  公钥: %s\n", pubKey)
+
+	// 生成对端密钥对
+	peerPrivKey, peerPubKey, err := generateWireGuardKeys()
+	if err != nil {
+		return fmt.Errorf("生成对端密钥失败: %w", err)
+	}
+	fmt.Printf("✓ 对端密钥对已生成\n")
+	fmt.Printf("  公钥: %s\n", peerPubKey)
+
+	// 确认信息
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("=== 确认信息 ===")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("类型:        WireGuard\n")
+	fmt.Printf("模式:        %s\n", map[string]string{"server": "服务端", "client": "客户端"}[wgMode])
+	fmt.Printf("父接口:      %s\n", parentInterface)
+	if wgMode == "client" {
+		// 客户端模式显示远程IP
+		fmt.Printf("远程IP:      %s\n", remoteIP)
+	}
+	fmt.Printf("远程虚拟IP:  %s\n", remoteVIP)
+	fmt.Printf("本地虚拟IP:  %s\n", localVIP)
+	fmt.Printf("隧道名:      %s\n", tunnelName)
+	if listenPort > 0 {
+		fmt.Printf("监听端口:    %d\n", listenPort)
+	} else {
+		fmt.Printf("监听端口:    自动分配\n")
+	}
+	if wgMode == "server" && peerListenPort > 0 {
+		fmt.Printf("对端端口:    %d\n", peerListenPort)
+	}
+	fmt.Printf("成本:        %d\n", cost)
+	fmt.Println(strings.Repeat("=", 60))
+
+	confirm := readInput("\n确认创建? (yes/no): ")
+	if confirm != "yes" && confirm != "y" {
+		fmt.Println("已取消")
+		return nil
+	}
+
+	// 创建隧道配置
+	tunnelConfig := &network.TunnelConfig{
+		Name:            tunnelName,
+		TunnelType:      "wireguard",
+		ParentInterface: parentInterface,
+		LocalIP:         "", // 自动从父接口获取
+		RemoteIP:        remoteIP,
+		LocalVIP:        localVIP,
+		RemoteVIP:       remoteVIP,
+		Cost:            cost,
+		Enabled:         true,
+		WGMode:          wgMode,
+		PrivateKey:      privKey,
+		PublicKey:       pubKey,
+		PeerPublicKey:   peerPubKey,
+		ListenPort:      listenPort,
+		PeerListenPort:  peerListenPort,
+	}
+
+	// 使用TunnelManager创建
+	fmt.Println("\n开始创建...")
+	tm := ipsec.NewTunnelManager(tunnelConfig)
+	if err := tm.Create(); err != nil {
+		return err
+	}
+
+	// 生成并显示对端配置命令
+	fmt.Println()
+	peerCmd := generatePeerCommand(tunnelConfig, peerPrivKey, peerPubKey)
+	fmt.Println(peerCmd)
+
+	// 保存对端配置到文件
+	if err := savePeerConfig(tunnelName, peerCmd); err != nil {
+		fmt.Printf("\n⚠️  保存对端配置失败: %v\n", err)
+	} else {
+		fmt.Printf("\n✓ 对端配置已保存到: /var/lib/trueword_node/peer_configs/%s.txt\n", tunnelName)
+	}
+
+	return nil
 }
 
 func main() {

@@ -20,11 +20,24 @@ type TunnelConfig struct {
 	RemoteIP        string `yaml:"remote_ip"`        // 远程IP
 	LocalVIP        string `yaml:"local_vip"`        // 本地虚拟IP
 	RemoteVIP       string `yaml:"remote_vip"`       // 远程虚拟IP
-	AuthKey         string `yaml:"auth_key"`         // 认证密钥
-	EncKey          string `yaml:"enc_key"`          // 加密密钥
 	Cost            int    `yaml:"cost"`             // 成本 (0-100, 默认0)
 	Enabled         bool   `yaml:"enabled"`          // 是否启用
-	UseEncryption   bool   `yaml:"use_encryption"`   // 是否使用IPsec加密
+
+	// 隧道类型 ("ipsec" 或 "wireguard")
+	TunnelType      string `yaml:"tunnel_type"`      // 隧道类型，默认 "ipsec"
+
+	// IPsec 专用字段 (仅 TunnelType="ipsec" 时使用)
+	AuthKey         string `yaml:"auth_key,omitempty"`         // 认证密钥
+	EncKey          string `yaml:"enc_key,omitempty"`          // 加密密钥
+	UseEncryption   bool   `yaml:"use_encryption,omitempty"`   // 是否使用IPsec加密
+
+	// WireGuard 专用字段 (仅 TunnelType="wireguard" 时使用)
+	WGMode          string `yaml:"wg_mode,omitempty"`          // WireGuard模式: "server" 或 "client"
+	PrivateKey      string `yaml:"private_key,omitempty"`      // 本地私钥
+	PublicKey       string `yaml:"public_key,omitempty"`       // 本地公钥
+	PeerPublicKey   string `yaml:"peer_public_key,omitempty"`  // 对端公钥
+	ListenPort      int    `yaml:"listen_port,omitempty"`      // 本地监听端口
+	PeerListenPort  int    `yaml:"peer_listen_port,omitempty"` // 对端监听端口
 }
 
 // SaveTunnelConfig 保存隧道配置
@@ -58,6 +71,11 @@ func LoadTunnelConfig(name string) (*TunnelConfig, error) {
 	var config TunnelConfig
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+	// 向后兼容：如果没有 TunnelType 字段，默认为 ipsec
+	if config.TunnelType == "" {
+		config.TunnelType = "ipsec"
 	}
 
 	return &config, nil
