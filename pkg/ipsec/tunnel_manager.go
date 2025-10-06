@@ -467,6 +467,17 @@ func (tm *TunnelManager) Start() error {
 		return nil
 	}
 
+	// 根据隧道类型启动
+	if cfg.TunnelType == "wireguard" {
+		return tm.startWireGuardTunnel()
+	}
+	return tm.startIPsecTunnel()
+}
+
+// startIPsecTunnel 启动 IPsec 隧道
+func (tm *TunnelManager) startIPsecTunnel() error {
+	cfg := tm.config
+
 	// 1. 设置策略路由
 	gateway, _ := getGatewayFromParent(cfg.ParentInterface)
 	if err := setupPolicyRoute(cfg.RemoteIP, cfg.ParentInterface, gateway); err != nil {
@@ -508,7 +519,47 @@ func (tm *TunnelManager) Start() error {
 	return nil
 }
 
-// Stop 停止隧道(删除IPsec连接和GRE隧道，保留配置)
+// startWireGuardTunnel 启动 WireGuard 隧道
+func (tm *TunnelManager) startWireGuardTunnel() error {
+	cfg := tm.config
+
+	// 1. 设置策略路由（服务端模式跳过）
+	gateway, _ := getGatewayFromParent(cfg.ParentInterface)
+	if cfg.RemoteIP != "0.0.0.0" {
+		if err := setupPolicyRoute(cfg.RemoteIP, cfg.ParentInterface, gateway); err != nil {
+			fmt.Printf("失败 (策略路由错误)\n")
+			return err
+		}
+	}
+
+	// 2. 创建 WireGuard 隧道
+	wgTunnel := &wireguard.WireGuardTunnel{
+		Name:            cfg.Name,
+		Mode:            cfg.WGMode,
+		LocalIP:         cfg.LocalIP,
+		RemoteIP:        cfg.RemoteIP,
+		LocalVIP:        cfg.LocalVIP,
+		RemoteVIP:       cfg.RemoteVIP,
+		PrivateKey:      cfg.PrivateKey,
+		PeerPublicKey:   cfg.PeerPublicKey,
+		ListenPort:      cfg.ListenPort,
+		PeerListenPort:  cfg.PeerListenPort,
+	}
+
+	if err := wgTunnel.Create(); err != nil {
+		// 失败时清理策略路由
+		if cfg.RemoteIP != "0.0.0.0" {
+			removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+		}
+		fmt.Printf("失败 (WireGuard错误)\n")
+		return err
+	}
+
+	fmt.Printf("✓\n")
+	return nil
+}
+
+// Stop 停止隧道(删除隧道接口，保留配置)
 func (tm *TunnelManager) Stop() error {
 	cfg := tm.config
 
@@ -519,6 +570,17 @@ func (tm *TunnelManager) Stop() error {
 		fmt.Printf("未运行\n")
 		return nil
 	}
+
+	// 根据隧道类型停止
+	if cfg.TunnelType == "wireguard" {
+		return tm.stopWireGuardTunnel()
+	}
+	return tm.stopIPsecTunnel()
+}
+
+// stopIPsecTunnel 停止 IPsec 隧道
+func (tm *TunnelManager) stopIPsecTunnel() error {
+	cfg := tm.config
 
 	// 1. 删除GRE隧道 (直接执行撤销命令，避免重复输出)
 	revFile := fmt.Sprintf("%s.rev", cfg.Name)
@@ -537,6 +599,26 @@ func (tm *TunnelManager) Stop() error {
 
 	// 3. 删除策略路由
 	removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+
+	fmt.Printf("✓\n")
+	return nil
+}
+
+// stopWireGuardTunnel 停止 WireGuard 隧道
+func (tm *TunnelManager) stopWireGuardTunnel() error {
+	cfg := tm.config
+
+	// 1. 删除 WireGuard 隧道 (执行撤销命令)
+	revFile := fmt.Sprintf("%s.rev", cfg.Name)
+	if err := executeRevCommands(revFile); err != nil {
+		fmt.Printf("失败 (WireGuard错误)\n")
+		return err
+	}
+
+	// 2. 删除策略路由（服务端模式跳过）
+	if cfg.RemoteIP != "0.0.0.0" {
+		removePolicyRoute(cfg.RemoteIP, cfg.ParentInterface)
+	}
 
 	fmt.Printf("✓\n")
 	return nil
