@@ -726,9 +726,15 @@ func main() {
 					fmt.Printf("已生成密钥对\n")
 					fmt.Printf("本地公钥: %s\n", pubKey)
 				} else {
-					// TODO: 从私钥计算公钥
-					fmt.Fprintln(os.Stderr, "错误: 暂不支持指定私钥，请使用自动生成")
-					os.Exit(1)
+					// 从私钥计算公钥
+					var err error
+					pubKey, err = wireguard.PublicKeyFromPrivate(privateKey)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "从私钥计算公钥失败: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("使用指定的私钥\n")
+					fmt.Printf("本地公钥: %s\n", pubKey)
 				}
 
 				// 处理服务端模式的远程IP

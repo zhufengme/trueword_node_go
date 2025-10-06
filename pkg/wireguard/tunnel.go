@@ -288,12 +288,12 @@ func pingHost(host string, timeout int) bool {
 	return err == nil
 }
 
-// GeneratePeerCommand 生成对端创建命令
+// GeneratePeerCommand 生成对端创建命令（完整命令行，可直接复制执行）
 func GeneratePeerCommand(config *network.TunnelConfig, peerPrivateKey, peerPublicKey string) string {
 	var sb strings.Builder
 
 	sb.WriteString("╔═══════════════════════════════════════════════════════════╗\n")
-	sb.WriteString("║  对端配置 (请在远程主机执行)                              ║\n")
+	sb.WriteString("║  对端配置 (请在远程主机执行以下命令)                      ║\n")
 	sb.WriteString("╚═══════════════════════════════════════════════════════════╝\n\n")
 
 	// 确定对端模式
@@ -304,20 +304,20 @@ func GeneratePeerCommand(config *network.TunnelConfig, peerPrivateKey, peerPubli
 		peerMode = "server"
 	}
 
-	// 1. 生成 twnode 命令
-	sb.WriteString("【创建命令】\n\n")
+	// 1. 生成完整的命令行命令
+	sb.WriteString("【对端创建命令】(复制以下完整命令到对端执行)\n\n")
 
-	// 构建命令（根据模式决定是否需要远程IP参数）
+	// 构建远程IP参数
 	var remoteIPArg string
 	if peerMode == "server" {
-		// 对端是服务端，不需要指定远程IP（交互时会自动设为0.0.0.0）
-		sb.WriteString("# 注意：以下命令在交互时选择服务端模式，无需输入远程IP\n")
-		remoteIPArg = "# (交互时选择服务端模式)"
+		// 对端是服务端，远程IP设为0.0.0.0（占位符，服务端不需要）
+		remoteIPArg = "0.0.0.0"
 	} else {
-		// 对端是客户端，需要知道本地IP
+		// 对端是客户端，需要连接到本地IP
 		remoteIPArg = config.LocalIP
 	}
 
+	// 构建完整命令
 	sb.WriteString(fmt.Sprintf("twnode line create <父接口> %s %s %s %s \\\n",
 		remoteIPArg,         // 对端的 remote_ip
 		config.LocalVIP,     // 对端的 remote_vip 是本地的 local_vip
@@ -327,50 +327,55 @@ func GeneratePeerCommand(config *network.TunnelConfig, peerPrivateKey, peerPubli
 	sb.WriteString("  --type wireguard \\\n")
 	sb.WriteString(fmt.Sprintf("  --mode %s \\\n", peerMode))
 
-	// 根据对端模式决定是否需要指定端口
+	// 对端的私钥（作为命令参数）
+	sb.WriteString(fmt.Sprintf("  --private-key '%s' \\\n", peerPrivateKey))
+
+	// 对端需要配置本地的公钥
+	sb.WriteString(fmt.Sprintf("  --peer-pubkey '%s'", config.PublicKey))
+
+	// 根据对端模式决定端口参数
 	if peerMode == "server" {
 		// 对端是服务端，需要指定监听端口
 		peerPort := config.PeerListenPort
 		if peerPort == 0 {
-			peerPort = 51820 // 建议默认值
+			peerPort = 51820 // 默认值
 		}
-		sb.WriteString(fmt.Sprintf("  --listen-port %d \\\n", peerPort))
+		sb.WriteString(fmt.Sprintf(" \\\n  --listen-port %d", peerPort))
+	} else {
+		// 对端是客户端，需要知道本地服务端的端口
+		sb.WriteString(fmt.Sprintf(" \\\n  --peer-port %d", config.ListenPort))
 	}
-	// 如果对端是客户端，不需要指定 listen-port（自动分配）
 
-	// 对端需要知道本地的端口
-	if config.WGMode == "server" {
-		// 本地是服务端，对端（客户端）需要知道本地监听端口
-		sb.WriteString(fmt.Sprintf("  --peer-port %d \\\n", config.ListenPort))
-	}
-	// 如果本地是客户端，对端是服务端，对端不需要知道本地端口（自动分配的）
+	sb.WriteString("\n\n")
 
-	sb.WriteString(fmt.Sprintf("  --peer-pubkey %s\n", config.PublicKey))
-
-	sb.WriteString("\n")
-
-	// 2. 提供密钥信息
-	sb.WriteString("【对端私钥】(执行命令时需要输入)\n\n")
-	sb.WriteString(fmt.Sprintf("%s\n\n", peerPrivateKey))
-
-	// 3. 参数说明
+	// 2. 参数说明
 	sb.WriteString("【参数说明】\n\n")
-	sb.WriteString("- <父接口>: 请根据对端实际网络接口填写 (如 eth0, tun01 等)\n")
-	sb.WriteString(fmt.Sprintf("- 模式: %s (与本地 %s 模式配对)\n", peerMode, config.WGMode))
+	sb.WriteString("- <父接口>: 请将 <父接口> 替换为对端实际的网络接口名 (如 eth0, ens33 等)\n")
+	sb.WriteString(fmt.Sprintf("- 隧道名: %s (与本地保持一致)\n", config.Name))
+	sb.WriteString(fmt.Sprintf("- 模式: %s (与本地 %s 模式互补)\n", peerMode, config.WGMode))
+
 	if peerMode == "client" {
 		sb.WriteString(fmt.Sprintf("- 对端将主动连接本地服务端: %s:%d\n", config.LocalIP, config.ListenPort))
 		sb.WriteString("- 对端监听端口将自动分配\n")
-		sb.WriteString("- 执行命令时会要求输入远程服务端IP，填写上面显示的本地IP\n")
 	} else {
-		sb.WriteString("- 对端是服务端模式，交互时选择 [1] 服务端模式\n")
-		sb.WriteString("- 对端无需指定远程IP（将等待本地客户端连接）\n")
 		peerPort := config.PeerListenPort
 		if peerPort == 0 {
 			peerPort = 51820
 		}
-		sb.WriteString(fmt.Sprintf("- 建议对端监听端口: %d (可根据实际情况调整)\n", peerPort))
+		sb.WriteString(fmt.Sprintf("- 对端作为服务端，监听端口: %d\n", peerPort))
+		sb.WriteString("- 对端等待本地客户端连接\n")
 	}
-	sb.WriteString("- 执行命令时会要求输入私钥，请粘贴上面的私钥\n")
+
+	sb.WriteString("\n")
+
+	// 3. 密钥信息（仅供查看，已包含在命令中）
+	sb.WriteString("【密钥信息】(已包含在上述命令中)\n\n")
+	sb.WriteString(fmt.Sprintf("对端私钥: %s\n", peerPrivateKey))
+	sb.WriteString(fmt.Sprintf("对端公钥: %s\n", peerPublicKey))
+	sb.WriteString(fmt.Sprintf("本地公钥: %s\n", config.PublicKey))
+
+	sb.WriteString("\n")
+	sb.WriteString("注意: 命令中已包含所有必需参数，替换 <父接口> 后可直接执行\n")
 
 	return sb.String()
 }
