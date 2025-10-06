@@ -250,22 +250,31 @@ func (wg *WireGuardTunnel) Create() error {
 	// WireGuard 握手说明
 	if wg.Mode == "client" {
 		fmt.Printf("\n   ⏳ 客户端模式：正在触发握手...\n")
-		// 客户端模式：发送 ping 触发握手，WireGuard 握手可能需要几秒
-		time.Sleep(2 * time.Second) // 等待接口完全就绪
+		// 客户端模式：主动触发握手
+		time.Sleep(1 * time.Second) // 等待接口就绪
 
-		// 尝试 ping（会触发 WireGuard 握手）
+		// 主动触发握手：使用 wg 命令检查状态并发送 ping
 		fmt.Printf("   ⏳ 正在建立加密连接（首次握手可能需要5-10秒）...\n")
-		if pingHostWithRetry(wg.RemoteVIP, 3, 10) { // 10秒超时，允许握手完成
-			fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", wg.LocalVIP, wg.RemoteVIP)
-			return nil
-		} else {
-			fmt.Printf("   ⚠️  握手超时，但隧道已创建\n")
-			fmt.Printf("      提示：WireGuard 握手会在有流量时自动建立\n")
-			fmt.Printf("      - 检查对端是否已启动: %s\n", wg.RemoteIP)
-			fmt.Printf("      - 检查防火墙是否允许 UDP %d\n", wg.PeerListenPort)
-			fmt.Printf("      - 稍后可使用 'twnode line check %s' 测试连通性\n", wg.Name)
-			return nil
+
+		// 先主动触发握手（发送多个 ping 包）
+		triggerWireGuardHandshake(wg.RemoteVIP, wg.Name)
+
+		// 等待握手完成
+		if waitForWireGuardHandshake(wg.Name, 15) { // 15秒超时
+			// 握手成功，测试连通性
+			if pingHost(wg.RemoteVIP, 3) {
+				fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", wg.LocalVIP, wg.RemoteVIP)
+				return nil
+			}
 		}
+
+		// 握手失败或超时
+		fmt.Printf("   ⚠️  握手超时，但隧道已创建\n")
+		fmt.Printf("      提示：WireGuard 握手会在有流量时自动建立\n")
+		fmt.Printf("      - 检查对端是否已启动: %s\n", wg.RemoteIP)
+		fmt.Printf("      - 检查防火墙是否允许 UDP %d\n", wg.PeerListenPort)
+		fmt.Printf("      - 如仍无法连接，尝试: twnode line stop %s && twnode line start %s\n", wg.Name, wg.Name)
+		return nil
 	} else {
 		// 服务端模式：被动等待客户端连接
 		fmt.Printf("\n   ⏳ 服务端模式：等待客户端连接...\n")
@@ -333,6 +342,48 @@ func pingHostWithRetry(host string, count int, totalTimeout int) bool {
 			return cmd.Run() == nil
 		}
 		// 等待1秒后重试（给WireGuard时间建立握手）
+		time.Sleep(1 * time.Second)
+	}
+
+	return false
+}
+
+// triggerWireGuardHandshake 主动触发 WireGuard 握手
+func triggerWireGuardHandshake(remoteVIP, interfaceName string) {
+	// 发送多个 ping 包主动触发握手
+	// WireGuard 握手由数据包触发，多发几个增加成功率
+	for i := 0; i < 5; i++ {
+		cmd := exec.Command("ping", "-c", "1", "-W", "1", "-I", interfaceName, remoteVIP)
+		cmd.Run() // 忽略错误，只是触发握手
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// waitForWireGuardHandshake 等待 WireGuard 握手完成
+func waitForWireGuardHandshake(interfaceName string, timeout int) bool {
+	startTime := time.Now()
+
+	for time.Since(startTime).Seconds() < float64(timeout) {
+		// 使用 wg show 检查握手状态
+		cmd := exec.Command("wg", "show", interfaceName, "latest-handshakes")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			// 输出格式: <公钥> <时间戳>
+			// 如果时间戳不为0，说明握手成功
+			lines := strings.Split(string(output), "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					timestamp := fields[1]
+					// 时间戳大于0说明有握手记录
+					if timestamp != "0" {
+						return true
+					}
+				}
+			}
+		}
+
+		// 每秒检查一次
 		time.Sleep(1 * time.Second)
 	}
 
