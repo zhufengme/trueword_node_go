@@ -155,14 +155,16 @@ func CheckWireGuardInstalled() error {
 
 // Create 创建 WireGuard 隧道
 func (wg *WireGuardTunnel) Create() error {
-	// 检查接口是否已存在
-	if interfaceExists(wg.Name) {
-		return fmt.Errorf("❌ 接口 %s 已存在", wg.Name)
-	}
-
-	// 清理旧配置
+	// 清理旧配置（如果存在）
 	revFile := fmt.Sprintf("%s.rev", wg.Name)
 	executeRevCommands(revFile)
+
+	// 再次检查并强制删除（防止之前创建失败但接口残留）
+	if interfaceExists(wg.Name) {
+		fmt.Printf("   ⚠️  接口 %s 已存在，正在清理...\n", wg.Name)
+		execCommandNoError(fmt.Sprintf("ip link set dev %s down", wg.Name))
+		execCommandNoError(fmt.Sprintf("ip link del dev %s", wg.Name))
+	}
 
 	// 记录撤销命令
 	revCommands := []string{

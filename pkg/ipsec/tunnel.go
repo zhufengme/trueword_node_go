@@ -232,14 +232,16 @@ func RemoveIPsec(ip1, ip2 string) error {
 
 // 创建GRE隧道
 func (t *Tunnel) Create() error {
-	// 检查接口是否已存在
-	if interfaceExists(t.Name) {
-		return fmt.Errorf("❌ 接口 %s 已存在", t.Name)
-	}
-
-	// 清理旧配置
+	// 清理旧配置（如果存在）
 	revFile := fmt.Sprintf("%s.rev", t.Name)
 	executeRevCommands(revFile)
+
+	// 再次检查并强制删除（防止之前创建失败但接口残留）
+	if interfaceExists(t.Name) {
+		fmt.Printf("   ⚠️  接口 %s 已存在，正在清理...\n", t.Name)
+		execCommandNoError(fmt.Sprintf("ip link set dev %s down", t.Name))
+		execCommandNoError(fmt.Sprintf("ip tunnel del %s", t.Name))
+	}
 
 	// 记录撤销命令
 	revCommands := []string{
