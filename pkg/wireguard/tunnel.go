@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"trueword_node/pkg/network"
 )
@@ -155,6 +156,11 @@ func CheckWireGuardInstalled() error {
 
 // Create 创建 WireGuard 隧道
 func (wg *WireGuardTunnel) Create() error {
+	// 检查并清理可能冲突的 WireGuard 配置
+	if err := checkAndCleanWireGuardConflicts(wg.Name); err != nil {
+		return err
+	}
+
 	// 清理旧配置（如果存在）
 	revFile := fmt.Sprintf("%s.rev", wg.Name)
 	executeRevCommands(revFile)
@@ -390,4 +396,90 @@ func SavePeerConfig(tunnelName, content string) error {
 
 	configPath := filepath.Join(PeerConfigDir, tunnelName+".txt")
 	return os.WriteFile(configPath, []byte(content), 0644)
+}
+
+// checkAndCleanWireGuardConflicts 检查并清理可能冲突的 WireGuard 配置
+func checkAndCleanWireGuardConflicts(interfaceName string) error {
+	// 1. 检查是否有 wg-quick 服务在运行
+	wgQuickService := fmt.Sprintf("wg-quick@%s", interfaceName)
+	statusCmd := exec.Command("systemctl", "is-active", wgQuickService)
+	if output, _ := statusCmd.CombinedOutput(); strings.TrimSpace(string(output)) == "active" {
+		fmt.Printf("\n⚠️  检测到 systemd 服务冲突:\n")
+		fmt.Printf("   服务 %s 正在运行\n", wgQuickService)
+		fmt.Printf("\n请选择处理方式:\n")
+		fmt.Printf("  [1] 停止并禁用该服务 (推荐)\n")
+		fmt.Printf("  [2] 取消创建，手动处理\n")
+
+		var choice string
+		fmt.Print("\n请选择 (1 或 2): ")
+		fmt.Scanln(&choice)
+
+		if choice == "1" {
+			fmt.Printf("\n正在停止服务 %s...\n", wgQuickService)
+			stopCmd := exec.Command("systemctl", "stop", wgQuickService)
+			if err := stopCmd.Run(); err != nil {
+				return fmt.Errorf("停止服务失败: %w", err)
+			}
+
+			fmt.Printf("正在禁用服务 %s...\n", wgQuickService)
+			disableCmd := exec.Command("systemctl", "disable", wgQuickService)
+			disableCmd.Run() // 忽略错误（可能本来就没启用）
+
+			fmt.Printf("✓ 服务已停止并禁用\n\n")
+		} else {
+			return fmt.Errorf("用户取消创建")
+		}
+	}
+
+	// 2. 检查 /etc/wireguard/ 目录下是否有同名配置文件
+	wgConfigPath := fmt.Sprintf("/etc/wireguard/%s.conf", interfaceName)
+	if _, err := os.Stat(wgConfigPath); err == nil {
+		fmt.Printf("\n⚠️  检测到 WireGuard 配置文件冲突:\n")
+		fmt.Printf("   文件 %s 已存在\n", wgConfigPath)
+		fmt.Printf("\n请选择处理方式:\n")
+		fmt.Printf("  [1] 备份并删除该配置 (推荐)\n")
+		fmt.Printf("  [2] 取消创建，手动处理\n")
+
+		var choice string
+		fmt.Print("\n请选择 (1 或 2): ")
+		fmt.Scanln(&choice)
+
+		if choice == "1" {
+			// 备份配置文件
+			backupPath := fmt.Sprintf("%s.backup.%d", wgConfigPath, time.Now().Unix())
+			fmt.Printf("\n正在备份配置文件到: %s\n", backupPath)
+
+			data, err := os.ReadFile(wgConfigPath)
+			if err != nil {
+				return fmt.Errorf("读取配置文件失败: %w", err)
+			}
+
+			if err := os.WriteFile(backupPath, data, 0600); err != nil {
+				return fmt.Errorf("备份配置文件失败: %w", err)
+			}
+
+			// 删除原配置
+			fmt.Printf("正在删除原配置文件...\n")
+			if err := os.Remove(wgConfigPath); err != nil {
+				return fmt.Errorf("删除配置文件失败: %w", err)
+			}
+
+			fmt.Printf("✓ 配置文件已备份并删除\n\n")
+		} else {
+			return fmt.Errorf("用户取消创建")
+		}
+	}
+
+	// 3. 检查是否有其他 WireGuard 接口使用相同端口
+	if interfaceExists(interfaceName) {
+		// 尝试获取接口的配置信息
+		wgShowCmd := exec.Command("wg", "show", interfaceName)
+		if output, err := wgShowCmd.CombinedOutput(); err == nil && len(output) > 0 {
+			fmt.Printf("\n⚠️  检测到接口 %s 已配置 WireGuard:\n", interfaceName)
+			fmt.Printf("%s\n", string(output))
+			fmt.Printf("\n将自动清理该接口并重新创建\n")
+		}
+	}
+
+	return nil
 }
