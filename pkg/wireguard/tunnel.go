@@ -247,18 +247,41 @@ func (wg *WireGuardTunnel) Create() error {
 
 	fmt.Printf("   ✓ WireGuard隧道已创建\n")
 
-	// 测试连通性
-	if pingHost(wg.RemoteVIP, 3) {
-		fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", wg.LocalVIP, wg.RemoteVIP)
-		return nil
-	} else {
-		modeDesc := "服务端"
-		if wg.Mode == "client" {
-			modeDesc = "客户端"
+	// WireGuard 握手说明
+	if wg.Mode == "client" {
+		fmt.Printf("\n   ⏳ 客户端模式：正在触发握手...\n")
+		// 客户端模式：发送 ping 触发握手，WireGuard 握手可能需要几秒
+		time.Sleep(2 * time.Second) // 等待接口完全就绪
+
+		// 尝试 ping（会触发 WireGuard 握手）
+		fmt.Printf("   ⏳ 正在建立加密连接（首次握手可能需要5-10秒）...\n")
+		if pingHostWithRetry(wg.RemoteVIP, 3, 10) { // 10秒超时，允许握手完成
+			fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", wg.LocalVIP, wg.RemoteVIP)
+			return nil
+		} else {
+			fmt.Printf("   ⚠️  握手超时，但隧道已创建\n")
+			fmt.Printf("      提示：WireGuard 握手会在有流量时自动建立\n")
+			fmt.Printf("      - 检查对端是否已启动: %s\n", wg.RemoteIP)
+			fmt.Printf("      - 检查防火墙是否允许 UDP %d\n", wg.PeerListenPort)
+			fmt.Printf("      - 稍后可使用 'twnode line check %s' 测试连通性\n", wg.Name)
+			return nil
 		}
-		fmt.Printf("   ⚠️  隧道已创建但未连接 (%s模式)\n", modeDesc)
-		fmt.Printf("      等待远程节点 %s 建立连接...\n", wg.RemoteIP)
-		return nil
+	} else {
+		// 服务端模式：被动等待客户端连接
+		fmt.Printf("\n   ⏳ 服务端模式：等待客户端连接...\n")
+		time.Sleep(2 * time.Second)
+
+		// 尝试 ping（可能对端还未连接）
+		if pingHost(wg.RemoteVIP, 5) {
+			fmt.Printf("   ✓ 隧道连接成功 (%s <-> %s)\n", wg.LocalVIP, wg.RemoteVIP)
+			return nil
+		} else {
+			fmt.Printf("   ⚠️  等待客户端建立连接\n")
+			fmt.Printf("      服务端已就绪，监听端口: %d\n", wg.ListenPort)
+			fmt.Printf("      等待远程节点 %s 连接...\n", wg.RemoteIP)
+			fmt.Printf("      稍后可使用 'twnode line check %s' 测试连通性\n", wg.Name)
+			return nil
+		}
 	}
 }
 
@@ -294,6 +317,26 @@ func pingHost(host string, timeout int) bool {
 	cmd := exec.Command("ping", "-c", "3", "-W", fmt.Sprintf("%d", timeout), host)
 	err := cmd.Run()
 	return err == nil
+}
+
+// pingHostWithRetry Ping检查（带重试，用于WireGuard握手）
+func pingHostWithRetry(host string, count int, totalTimeout int) bool {
+	// WireGuard 握手可能需要时间，使用较长的包间隔和总超时
+	// 发送 count 个包，包间隔 2 秒，总超时 totalTimeout 秒
+	startTime := time.Now()
+
+	for time.Since(startTime).Seconds() < float64(totalTimeout) {
+		cmd := exec.Command("ping", "-c", "1", "-W", "2", host)
+		if err := cmd.Run(); err == nil {
+			// 第一个包通了，再发几个确认
+			cmd = exec.Command("ping", "-c", fmt.Sprintf("%d", count-1), "-W", "2", host)
+			return cmd.Run() == nil
+		}
+		// 等待1秒后重试（给WireGuard时间建立握手）
+		time.Sleep(1 * time.Second)
+	}
+
+	return false
 }
 
 // GeneratePeerCommand 生成对端创建命令（完整命令行，可直接复制执行）
