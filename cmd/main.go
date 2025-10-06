@@ -1098,8 +1098,87 @@ func main() {
 		},
 	}
 
+	// 显示对端配置命令
+	lineShowPeerCmd := &cobra.Command{
+		Use:   "show-peer <tunnel_name>",
+		Short: "显示对端创建命令",
+		Long:  "显示已创建隧道的对端配置命令，支持 IPsec 和 WireGuard",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnelName := args[0]
+
+			// 加载隧道配置
+			tunnelConfig, err := network.LoadTunnelConfig(tunnelName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "加载隧道配置失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 根据隧道类型生成对端配置
+			if tunnelConfig.TunnelType == "wireguard" {
+				// WireGuard 隧道
+				// 检查是否有保存的对端配置
+				peerConfigPath := fmt.Sprintf("/var/lib/trueword_node/peer_configs/%s.txt", tunnelName)
+				if data, err := os.ReadFile(peerConfigPath); err == nil {
+					fmt.Println(string(data))
+					return
+				}
+
+				// 如果没有保存的配置，尝试重新生成（需要对端密钥）
+				fmt.Printf("⚠️  未找到保存的对端配置文件\n\n")
+				fmt.Printf("WireGuard 隧道的对端配置需要对端私钥，该私钥在创建时生成。\n")
+				fmt.Printf("如果您丢失了对端配置，建议重新创建隧道。\n\n")
+				fmt.Printf("您可以查看当前隧道配置:\n")
+				fmt.Printf("  隧道名: %s\n", tunnelConfig.Name)
+				fmt.Printf("  模式: %s\n", tunnelConfig.WGMode)
+				fmt.Printf("  本地IP: %s\n", tunnelConfig.LocalIP)
+				fmt.Printf("  本地VIP: %s\n", tunnelConfig.LocalVIP)
+				fmt.Printf("  远程VIP: %s\n", tunnelConfig.RemoteVIP)
+				fmt.Printf("  本地公钥: %s\n", tunnelConfig.PublicKey)
+				fmt.Printf("  监听端口: %d\n", tunnelConfig.ListenPort)
+
+			} else {
+				// IPsec 隧道
+				fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+				fmt.Println("║  对端配置 (请在远程主机执行以下命令)                      ║")
+				fmt.Println("╚═══════════════════════════════════════════════════════════╝\n")
+
+				fmt.Println("【对端创建命令】(复制以下命令到对端执行)\n")
+
+				// 构建对端命令（IPsec 参数相同）
+				fmt.Printf("twnode line create <父接口> %s %s %s %s \\\n",
+					tunnelConfig.LocalIP,    // 对端的 remote_ip
+					tunnelConfig.LocalVIP,   // 对端的 remote_vip
+					tunnelConfig.RemoteVIP,  // 对端的 local_vip
+					tunnelConfig.Name)       // 隧道名
+
+				if tunnelConfig.UseEncryption {
+					fmt.Printf("  --auth-key '%s' \\\n", tunnelConfig.AuthKey)
+					if tunnelConfig.EncKey != tunnelConfig.AuthKey {
+						fmt.Printf("  --enc-key '%s' \\\n", tunnelConfig.EncKey)
+					}
+				}
+
+				if tunnelConfig.Cost > 0 {
+					fmt.Printf("  --cost %d", tunnelConfig.Cost)
+				}
+
+				fmt.Println("\n")
+
+				fmt.Println("【参数说明】\n")
+				fmt.Println("- <父接口>: 请将 <父接口> 替换为对端实际的网络接口名 (如 eth0, ens33 等)")
+				fmt.Printf("- 隧道名: %s (与本地保持一致)\n", tunnelConfig.Name)
+				fmt.Printf("- 对端需要连接到本地IP: %s\n", tunnelConfig.LocalIP)
+				if tunnelConfig.UseEncryption {
+					fmt.Println("- 认证和加密密钥与本地相同")
+				}
+				fmt.Println("\n注意: 命令中已包含所有必需参数，替换 <父接口> 后可直接执行")
+			}
+		},
+	}
+
 	lineCmd.AddCommand(lineCreateCmd, lineRemoveCmd, lineStartCmd, lineStopCmd,
-		lineEnableCmd, lineDisableCmd, lineCheckCmd, lineStartAllCmd, lineStopAllCmd, lineSetCostCmd)
+		lineEnableCmd, lineDisableCmd, lineCheckCmd, lineStartAllCmd, lineStopAllCmd, lineSetCostCmd, lineShowPeerCmd)
 
 	// 策略路由命令组
 	policyCmd := &cobra.Command{
