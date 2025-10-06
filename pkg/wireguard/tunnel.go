@@ -492,6 +492,38 @@ func SavePeerConfig(tunnelName, content string) error {
 	return os.WriteFile(configPath, []byte(content), 0644)
 }
 
+// GetWireGuardPeerEndpoint 获取 WireGuard 对端的实际 endpoint IP
+// 从 "wg show <interface> endpoints" 输出解析
+// 返回格式: "IP:Port" 或空字符串（如果没有连接）
+func GetWireGuardPeerEndpoint(interfaceName string) string {
+	cmd := exec.Command("wg", "show", interfaceName, "endpoints")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	// 输出格式: <peer_pubkey>\t<endpoint_ip:port>
+	// 例如: xY9zA0bC1dE2fG3hI4jK5lM6nO7pQ8rS9tU0vW1xY2zA4=	192.168.1.100:51820
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			endpoint := fields[1]
+			// 提取IP部分（去掉端口）
+			if idx := strings.LastIndex(endpoint, ":"); idx > 0 {
+				return endpoint[:idx]
+			}
+		}
+	}
+
+	return ""
+}
+
 // checkAndCleanWireGuardConflicts 检查并清理可能冲突的 WireGuard 配置
 func checkAndCleanWireGuardConflicts(interfaceName string) error {
 	// 1. 检查是否有 wg-quick 服务在运行

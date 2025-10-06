@@ -13,6 +13,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/vishvananda/netlink"
 	"trueword_node/pkg/network"
+	"trueword_node/pkg/wireguard"
 )
 
 const (
@@ -292,13 +293,33 @@ func (pm *PolicyManager) Apply() error {
 	}
 
 	// 2. 获取所有隧道，为它们设置保护路由
-	tunnels, _ := getTunnelInterfaces()
-	if len(tunnels) > 0 {
-		fmt.Println("\n添加系统保护路由...")
-		for _, tunnel := range tunnels {
-			// 获取隧道的远程IP
-			remoteIP, err := getTunnelRemoteIP(tunnel)
-			if err != nil || remoteIP == "" {
+	fmt.Println("\n添加系统保护路由...")
+	protectedCount := 0
+
+	// 从配置文件读取所有隧道（支持 GRE 和 WireGuard）
+	tunnelConfigs, err := getAllTunnelConfigs()
+	if err == nil && len(tunnelConfigs) > 0 {
+		for _, config := range tunnelConfigs {
+			remoteIP := config.RemoteIP
+
+			// 如果是 WireGuard 且 RemoteIP 是 0.0.0.0，尝试从运行状态获取
+			if config.TunnelType == "wireguard" && (remoteIP == "" || remoteIP == "0.0.0.0") {
+				// 检查接口是否运行
+				if network.IsInterfaceUp(config.Name) {
+					// 尝试从 wg show 获取对端实际 IP
+					endpoint := getWireGuardPeerEndpoint(config.Name)
+					if endpoint != "" {
+						remoteIP = endpoint
+						fmt.Printf("  ℹ 从运行状态检测到 WireGuard 隧道 %s 的对端IP: %s\n", config.Name, remoteIP)
+					}
+				}
+			}
+
+			// 如果仍然没有有效的远程IP，跳过
+			if remoteIP == "" || remoteIP == "0.0.0.0" {
+				if config.TunnelType == "wireguard" {
+					fmt.Printf("  ⚠ 跳过 WireGuard 服务器模式隧道 %s (无对端连接)\n", config.Name)
+				}
 				continue
 			}
 
@@ -312,9 +333,18 @@ func (pm *PolicyManager) Apply() error {
 			if err := execIPCommand(cmd); err != nil {
 				fmt.Printf("  ⚠ 警告: 添加保护路由失败: %s\n", err)
 			} else {
-				fmt.Printf("  ✓ 保护隧道 %s 的远程IP %s\n", tunnel, remoteIP)
+				tunnelType := "GRE"
+				if config.TunnelType == "wireguard" {
+					tunnelType = "WireGuard"
+				}
+				fmt.Printf("  ✓ 保护 %s 隧道 %s 的远程IP %s\n", tunnelType, config.Name, remoteIP)
+				protectedCount++
 			}
 		}
+	}
+
+	if protectedCount == 0 {
+		fmt.Printf("  未找到需要保护的隧道远程IP\n")
 	}
 
 	// 3. 创建路由表并添加策略（仅应用有效的策略组）
@@ -1325,4 +1355,46 @@ func (pm *PolicyManager) FailoverDefault(candidates []string, checkIP string) er
 
 	fmt.Println("\033[92mFailover 完成！\033[0m")
 	return nil
+}
+
+// getAllTunnelConfigs 获取所有隧道配置（GRE 和 WireGuard）
+func getAllTunnelConfigs() ([]*network.TunnelConfig, error) {
+	tunnelDir := "/etc/trueword_node/tunnels"
+
+	entries, err := os.ReadDir(tunnelDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	configs := make([]*network.TunnelConfig, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		// 提取隧道名（去掉 .yaml 后缀）
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		tunnelName := strings.TrimSuffix(name, ".yaml")
+
+		// 加载配置
+		config, err := network.LoadTunnelConfig(tunnelName)
+		if err != nil {
+			continue
+		}
+
+		configs = append(configs, config)
+	}
+
+	return configs, nil
+}
+
+// getWireGuardPeerEndpoint 包装 wireguard 包的函数
+func getWireGuardPeerEndpoint(interfaceName string) string {
+	return wireguard.GetWireGuardPeerEndpoint(interfaceName)
 }
