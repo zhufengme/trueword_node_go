@@ -38,6 +38,9 @@ type TunnelConfig struct {
 	PeerPublicKey   string `yaml:"peer_public_key,omitempty"`  // 对端公钥
 	ListenPort      int    `yaml:"listen_port,omitempty"`      // 本地监听端口
 	PeerListenPort  int    `yaml:"peer_listen_port,omitempty"` // 对端监听端口
+
+	// 策略路由保护字段（所有类型隧道共用）
+	ProtectedIP     string `yaml:"protected_ip,omitempty"`     // 当前保护路由使用的对端IP
 }
 
 // SaveTunnelConfig 保存隧道配置

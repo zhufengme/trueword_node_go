@@ -1794,9 +1794,25 @@ func main() {
 		},
 	}
 
+	// policy check-protection 命令
+	var cleanFlag bool
+	policyCheckProtectionCmd := &cobra.Command{
+		Use:   "check-protection",
+		Short: "检查和清理保护路由规则",
+		Long:  "检查系统保护路由规则（优先级10），识别并清理僵尸规则",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := routing.CheckProtectionRules(cleanFlag); err != nil {
+				fmt.Printf("❌ 检查失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+	policyCheckProtectionCmd.Flags().BoolVar(&cleanFlag, "clean", false, "自动清理僵尸规则")
+
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
-		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policySetPriorityCmd, policyDeleteCmd)
+		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policySetPriorityCmd,
+		policyDeleteCmd, policyCheckProtectionCmd)
 
 	// 版本命令
 	versionCmd := &cobra.Command{

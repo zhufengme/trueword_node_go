@@ -295,6 +295,7 @@ func (pm *PolicyManager) Apply() error {
 	// 2. 获取所有隧道，为它们设置保护路由
 	fmt.Println("\n添加系统保护路由...")
 	protectedCount := 0
+	updatedCount := 0
 
 	// 从配置文件读取所有隧道（支持 GRE 和 WireGuard）
 	tunnelConfigs, err := getAllTunnelConfigs()
@@ -320,10 +321,29 @@ func (pm *PolicyManager) Apply() error {
 				if config.TunnelType == "wireguard" {
 					fmt.Printf("  ⚠ 跳过 WireGuard 服务器模式隧道 %s (无对端连接)\n", config.Name)
 				}
+				// 如果之前有保护IP，清理旧的保护路由
+				if config.ProtectedIP != "" {
+					delCmd := fmt.Sprintf("ip rule del to %s lookup main pref %d", config.ProtectedIP, PrioSystem)
+					execIPCommandNoError(delCmd)
+					config.ProtectedIP = ""
+					network.SaveTunnelConfig(config)
+				}
 				continue
 			}
 
-			// 先删除旧的保护路由（如果存在）
+			// 检查IP是否变化
+			ipChanged := false
+			if config.ProtectedIP != "" && config.ProtectedIP != remoteIP {
+				// IP已变化，先删除旧的保护路由
+				delCmd := fmt.Sprintf("ip rule del to %s lookup main pref %d", config.ProtectedIP, PrioSystem)
+				execIPCommandNoError(delCmd)
+				fmt.Printf("  ⚠ %s 隧道 %s 对端IP已变化: %s → %s\n",
+					getTunnelTypeDisplay(config.TunnelType), config.Name, config.ProtectedIP, remoteIP)
+				ipChanged = true
+				updatedCount++
+			}
+
+			// 删除当前remoteIP的旧规则（防止重复）
 			delCmd := fmt.Sprintf("ip rule del to %s lookup main pref %d", remoteIP, PrioSystem)
 			execIPCommandNoError(delCmd)
 
@@ -333,18 +353,25 @@ func (pm *PolicyManager) Apply() error {
 			if err := execIPCommand(cmd); err != nil {
 				fmt.Printf("  ⚠ 警告: 添加保护路由失败: %s\n", err)
 			} else {
-				tunnelType := "GRE"
-				if config.TunnelType == "wireguard" {
-					tunnelType = "WireGuard"
+				if !ipChanged {
+					fmt.Printf("  ✓ 保护 %s 隧道 %s 的远程IP %s\n",
+						getTunnelTypeDisplay(config.TunnelType), config.Name, remoteIP)
 				}
-				fmt.Printf("  ✓ 保护 %s 隧道 %s 的远程IP %s\n", tunnelType, config.Name, remoteIP)
 				protectedCount++
+
+				// 更新配置文件中的 ProtectedIP
+				if config.ProtectedIP != remoteIP {
+					config.ProtectedIP = remoteIP
+					network.SaveTunnelConfig(config)
+				}
 			}
 		}
 	}
 
 	if protectedCount == 0 {
 		fmt.Printf("  未找到需要保护的隧道远程IP\n")
+	} else if updatedCount > 0 {
+		fmt.Printf("  已更新 %d 个隧道的保护路由\n", updatedCount)
 	}
 
 	// 3. 创建路由表并添加策略（仅应用有效的策略组）
@@ -1397,4 +1424,130 @@ func getAllTunnelConfigs() ([]*network.TunnelConfig, error) {
 // getWireGuardPeerEndpoint 包装 wireguard 包的函数
 func getWireGuardPeerEndpoint(interfaceName string) string {
 	return wireguard.GetWireGuardPeerEndpoint(interfaceName)
+}
+
+// getTunnelTypeDisplay 获取隧道类型的显示名称
+func getTunnelTypeDisplay(tunnelType string) string {
+	if tunnelType == "wireguard" {
+		return "WireGuard"
+	}
+	return "GRE"
+}
+
+// CheckProtectionRules 检查和清理保护路由规则
+func CheckProtectionRules(autoClean bool) error {
+	fmt.Println("检查系统保护路由规则...")
+	fmt.Println()
+
+	// 1. 获取所有优先级10的规则
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("ip rule show pref %d", PrioSystem))
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("获取保护路由规则失败: %w", err)
+	}
+
+	if len(output) == 0 {
+		fmt.Println("✓ 未找到任何保护路由规则")
+		return nil
+	}
+
+	// 解析规则，提取保护的IP
+	protectedIPs := make(map[string]bool)
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// 规则格式: 10:	from all to 1.2.3.4 lookup main
+		parts := strings.Fields(line)
+		for i, part := range parts {
+			if part == "to" && i+1 < len(parts) {
+				ip := parts[i+1]
+				protectedIPs[ip] = true
+				break
+			}
+		}
+	}
+
+	if len(protectedIPs) == 0 {
+		fmt.Println("✓ 未找到任何保护路由规则")
+		return nil
+	}
+
+	fmt.Printf("找到 %d 个保护路由规则:\n\n", len(protectedIPs))
+
+	// 2. 加载所有隧道配置
+	tunnelConfigs, err := getAllTunnelConfigs()
+	if err != nil {
+		return fmt.Errorf("加载隧道配置失败: %w", err)
+	}
+
+	// 建立有效IP集合（当前活动隧道的对端IP）
+	validIPs := make(map[string]string) // IP -> 隧道名
+	for _, config := range tunnelConfigs {
+		remoteIP := config.RemoteIP
+
+		// WireGuard特殊处理
+		if config.TunnelType == "wireguard" && (remoteIP == "" || remoteIP == "0.0.0.0") {
+			if network.IsInterfaceUp(config.Name) {
+				endpoint := getWireGuardPeerEndpoint(config.Name)
+				if endpoint != "" {
+					remoteIP = endpoint
+				}
+			}
+		}
+
+		if remoteIP != "" && remoteIP != "0.0.0.0" {
+			validIPs[remoteIP] = config.Name
+		}
+	}
+
+	// 3. 检查每个保护的IP是否有效
+	orphanedIPs := make([]string, 0)
+	for ip := range protectedIPs {
+		tunnelName, valid := validIPs[ip]
+		if valid {
+			fmt.Printf("  ✓ %s - 有效 (隧道: %s)\n", ip, tunnelName)
+		} else {
+			fmt.Printf("  ✗ %s - 无效 (无对应隧道)\n", ip)
+			orphanedIPs = append(orphanedIPs, ip)
+		}
+	}
+
+	fmt.Println()
+
+	// 4. 处理僵尸规则
+	if len(orphanedIPs) == 0 {
+		fmt.Println("✓ 所有保护路由规则都有效，无需清理")
+		return nil
+	}
+
+	fmt.Printf("发现 %d 个僵尸规则（无对应隧道）\n", len(orphanedIPs))
+
+	if !autoClean {
+		fmt.Println("\n提示: 使用 'twnode policy check-protection --clean' 自动清理")
+		return nil
+	}
+
+	// 自动清理
+	fmt.Println("\n开始清理僵尸规则...")
+	cleanedCount := 0
+	for _, ip := range orphanedIPs {
+		cmd := fmt.Sprintf("ip rule del to %s lookup main pref %d", ip, PrioSystem)
+		if err := execIPCommand(cmd); err != nil {
+			fmt.Printf("  ✗ 清理 %s 失败: %v\n", ip, err)
+		} else {
+			fmt.Printf("  ✓ 已清理 %s\n", ip)
+			cleanedCount++
+		}
+	}
+
+	fmt.Printf("\n✓ 清理完成: 成功 %d/%d\n", cleanedCount, len(orphanedIPs))
+
+	// 刷新路由缓存
+	exec.Command("ip", "route", "flush", "cache").Run()
+
+	return nil
 }
