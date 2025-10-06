@@ -655,16 +655,9 @@ func main() {
 				fmt.Printf("隧道名未指定，自动分配: %s\n", tunnelName)
 			}
 
-			// 获取密钥
-			authPass, _ := cmd.Flags().GetString("auth-key")
-			encPass, _ := cmd.Flags().GetString("enc-key")
+			// 获取隧道类型
+			tunnelType, _ := cmd.Flags().GetString("type")
 			cost, _ := cmd.Flags().GetInt("cost")
-
-			if authPass == "" {
-				fmt.Fprintln(os.Stderr, "错误: 命令行模式必须指定 --auth-key")
-				fmt.Fprintln(os.Stderr, "或不带参数进入交互模式: twnode line create")
-				os.Exit(1)
-			}
 
 			// 验证成本值范围
 			if cost < 0 || cost > 100 {
@@ -672,31 +665,132 @@ func main() {
 				os.Exit(1)
 			}
 
-			// 如果未指定加密密钥，使用认证密钥
-			if encPass == "" {
-				encPass = authPass
-			}
+			var tunnelConfig *network.TunnelConfig
+			var generatePeerConfig bool
+			var peerPrivKey, peerPubkey string
 
-			// 生成密钥
-			authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "生成密钥失败: %v\n", err)
-				os.Exit(1)
-			}
+			if tunnelType == "wireguard" {
+				// WireGuard 模式
+				wgMode, _ := cmd.Flags().GetString("mode")
+				peerPubkey, _ = cmd.Flags().GetString("peer-pubkey")
+				privateKey, _ := cmd.Flags().GetString("private-key")
+				listenPort, _ := cmd.Flags().GetInt("listen-port")
+				peerPort, _ := cmd.Flags().GetInt("peer-port")
 
-			// 创建隧道配置
-			tunnelConfig := &network.TunnelConfig{
-				Name:            tunnelName,
-				ParentInterface: parentInterface,
-				LocalIP:         "", // 自动从父接口获取
-				RemoteIP:        remoteIP,
-				LocalVIP:        localVIP,
-				RemoteVIP:       remoteVIP,
-				AuthKey:         authKey,
-				EncKey:          encKey,
-				Cost:            cost,
-				Enabled:         true,
-				UseEncryption:   true, // 始终加密
+				// 验证必需参数
+				if wgMode == "" {
+					fmt.Fprintln(os.Stderr, "错误: WireGuard模式必须指定 --mode (server 或 client)")
+					os.Exit(1)
+				}
+				if wgMode != "server" && wgMode != "client" {
+					fmt.Fprintln(os.Stderr, "错误: --mode 必须是 server 或 client")
+					os.Exit(1)
+				}
+
+				// 如果没有提供对端公钥，则自动生成对端密钥对
+				if peerPubkey == "" {
+					var err error
+					peerPrivKey, peerPubkey, err = wireguard.GenerateKeyPair()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "生成对端密钥失败: %v\n", err)
+						os.Exit(1)
+					}
+					generatePeerConfig = true
+					fmt.Printf("未指定对端公钥，已自动生成对端密钥对\n")
+					fmt.Printf("对端公钥: %s\n", peerPubkey)
+				}
+
+				// 模式特定验证
+				if wgMode == "server" {
+					if listenPort == 0 {
+						listenPort = 51820 // 默认端口
+					}
+				} else {
+					// client 模式
+					if peerPort == 0 {
+						fmt.Fprintln(os.Stderr, "错误: client模式必须指定 --peer-port")
+						os.Exit(1)
+					}
+					listenPort = 0 // client 自动分配
+				}
+
+				// 生成或使用私钥
+				var pubKey string
+				if privateKey == "" {
+					var err error
+					privateKey, pubKey, err = wireguard.GenerateKeyPair()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "生成密钥失败: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("已生成密钥对\n")
+					fmt.Printf("本地公钥: %s\n", pubKey)
+				} else {
+					// TODO: 从私钥计算公钥
+					fmt.Fprintln(os.Stderr, "错误: 暂不支持指定私钥，请使用自动生成")
+					os.Exit(1)
+				}
+
+				// 处理服务端模式的远程IP
+				actualRemoteIP := remoteIP
+				if wgMode == "server" {
+					actualRemoteIP = "0.0.0.0"
+				}
+
+				tunnelConfig = &network.TunnelConfig{
+					Name:            tunnelName,
+					ParentInterface: parentInterface,
+					LocalIP:         "", // 自动从父接口获取
+					RemoteIP:        actualRemoteIP,
+					LocalVIP:        localVIP,
+					RemoteVIP:       remoteVIP,
+					Cost:            cost,
+					Enabled:         true,
+					TunnelType:      "wireguard",
+					WGMode:          wgMode,
+					PrivateKey:      privateKey,
+					PublicKey:       pubKey,
+					PeerPublicKey:   peerPubkey,
+					ListenPort:      listenPort,
+					PeerListenPort:  peerPort,
+				}
+			} else {
+				// IPsec 模式
+				authPass, _ := cmd.Flags().GetString("auth-key")
+				encPass, _ := cmd.Flags().GetString("enc-key")
+
+				if authPass == "" {
+					fmt.Fprintln(os.Stderr, "错误: IPsec模式必须指定 --auth-key")
+					fmt.Fprintln(os.Stderr, "或不带参数进入交互模式: twnode line create")
+					os.Exit(1)
+				}
+
+				// 如果未指定加密密钥，使用认证密钥
+				if encPass == "" {
+					encPass = authPass
+				}
+
+				// 生成密钥
+				authKey, encKey, err := config.GenerateIPsecKeys(authPass, encPass)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "生成密钥失败: %v\n", err)
+					os.Exit(1)
+				}
+
+				tunnelConfig = &network.TunnelConfig{
+					Name:            tunnelName,
+					ParentInterface: parentInterface,
+					LocalIP:         "", // 自动从父接口获取
+					RemoteIP:        remoteIP,
+					LocalVIP:        localVIP,
+					RemoteVIP:       remoteVIP,
+					AuthKey:         authKey,
+					EncKey:          encKey,
+					Cost:            cost,
+					Enabled:         true,
+					TunnelType:      "ipsec",
+					UseEncryption:   true, // 始终加密
+				}
 			}
 
 			// 使用TunnelManager创建
@@ -705,10 +799,34 @@ func main() {
 				fmt.Fprintf(os.Stderr, "创建失败: %v\n", err)
 				os.Exit(1)
 			}
+
+			// WireGuard 模式输出对端配置
+			if tunnelType == "wireguard" && generatePeerConfig {
+				fmt.Println()
+				peerCmd := generatePeerCommand(tunnelConfig, peerPrivKey, peerPubkey)
+				fmt.Println(peerCmd)
+
+				if err := savePeerConfig(tunnelName, peerCmd); err != nil {
+					fmt.Fprintf(os.Stderr, "保存对端配置失败: %v\n", err)
+				} else {
+					fmt.Printf("对端配置已保存到: /var/lib/trueword_node/peer_configs/%s.txt\n", tunnelName)
+				}
+			}
 		},
 	}
-	lineCreateCmd.Flags().String("auth-key", "", "认证密钥字符串(命令行模式必需)")
+	// IPsec 相关参数
+	lineCreateCmd.Flags().String("auth-key", "", "认证密钥字符串(IPsec模式必需)")
 	lineCreateCmd.Flags().String("enc-key", "", "加密密钥字符串(可选,不指定则使用auth-key)")
+
+	// WireGuard 相关参数
+	lineCreateCmd.Flags().String("type", "ipsec", "隧道类型: ipsec 或 wireguard (默认ipsec)")
+	lineCreateCmd.Flags().String("mode", "", "WireGuard模式: server 或 client (WireGuard必需)")
+	lineCreateCmd.Flags().String("private-key", "", "WireGuard私钥(可选,不指定则自动生成)")
+	lineCreateCmd.Flags().String("peer-pubkey", "", "对端公钥(WireGuard必需)")
+	lineCreateCmd.Flags().Int("listen-port", 0, "本地监听端口(WireGuard server模式必需,默认51820)")
+	lineCreateCmd.Flags().Int("peer-port", 0, "对端监听端口(WireGuard client模式必需)")
+
+	// 通用参数
 	lineCreateCmd.Flags().Int("cost", 0, "成本值(0-100,默认0)")
 
 	// 删除隧道
