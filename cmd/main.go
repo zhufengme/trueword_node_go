@@ -872,6 +872,12 @@ func main() {
 			}
 			fmt.Println()
 			fmt.Printf("✓ 隧道 %s 启动成功\n", tunnelName)
+
+			// 启动后同步保护路由
+			fmt.Println()
+			if err := routing.SyncProtection(); err != nil {
+				fmt.Printf("⚠ 警告: 同步保护路由失败: %v\n", err)
+			}
 		},
 	}
 
@@ -1042,6 +1048,12 @@ func main() {
 			if err := ipsec.StartAllTunnels(); err != nil {
 				fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 				os.Exit(1)
+			}
+
+			// 启动后同步保护路由
+			fmt.Println()
+			if err := routing.SyncProtection(); err != nil {
+				fmt.Printf("⚠ 警告: 同步保护路由失败: %v\n", err)
 			}
 		},
 	}
@@ -1794,25 +1806,29 @@ func main() {
 		},
 	}
 
-	// policy check-protection 命令
-	var cleanFlag bool
-	policyCheckProtectionCmd := &cobra.Command{
-		Use:   "check-protection",
-		Short: "检查和清理保护路由规则",
-		Long:  "检查系统保护路由规则（优先级10），识别并清理僵尸规则",
+	// policy sync-protection 命令
+	policySyncProtectionCmd := &cobra.Command{
+		Use:   "sync-protection",
+		Short: "同步保护路由规则",
+		Long: `同步系统保护路由规则（优先级10）：
+  - 检测隧道对端IP变化并自动更新
+  - 添加缺失的保护路由
+  - 清理僵尸规则（无对应隧道的保护路由）
+
+适合放在 cron 定时任务中运行，例如：
+  */5 * * * * /usr/local/bin/twnode policy sync-protection >/dev/null 2>&1`,
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := routing.CheckProtectionRules(cleanFlag); err != nil {
-				fmt.Printf("❌ 检查失败: %v\n", err)
+			if err := routing.SyncProtection(); err != nil {
+				fmt.Printf("❌ 同步失败: %v\n", err)
 				os.Exit(1)
 			}
 		},
 	}
-	policyCheckProtectionCmd.Flags().BoolVar(&cleanFlag, "clean", false, "自动清理僵尸规则")
 
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
 		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policySetPriorityCmd,
-		policyDeleteCmd, policyCheckProtectionCmd)
+		policyDeleteCmd, policySyncProtectionCmd)
 
 	// 版本命令
 	versionCmd := &cobra.Command{
