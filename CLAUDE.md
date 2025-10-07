@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
+TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 和 **WireGuard** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
 
-**当前版本**：v1.2
+**当前版本**：v1.2+
 
 **最新特性**：
+- **WireGuard 隧道支持**（服务器/客户端模式，完整密钥管理）
+- **动态IP容错机制**（自动检测对端IP变化，智能更新保护路由）
+- **保护路由自动同步**（`policy sync-protection` 命令，适合 cron 定时任务）
 - 策略组优先级自定义（手动指定或自动分配）
 - 优先级调整命令（`policy set-priority`）
 - 优先级冲突检测和验证
@@ -63,9 +66,13 @@ make clean               # 清理构建产物
 - `pkg/network/parent_interface.go` - 列出所有可用父接口
 - `pkg/network/interface.go` - 物理接口扫描和管理
 
-### 2. 双层隧道机制
+### 2. 隧道类型支持
 
-每个隧道由两层组成：
+项目支持两种隧道类型，通过 `TunnelType` 字段区分：
+
+#### 2.1 GRE over IPsec 隧道（传统方式）
+
+**双层结构**：
 
 **第一层：IPsec ESP 隧道**（可选加密层）
 - 使用 `ip xfrm` 管理 XFRM state 和 policy
@@ -78,6 +85,32 @@ make clean               # 清理构建产物
 - GRE Key 从认证密钥生成（确保对称性）
 - 虚拟IP在GRE接口上配置
 - 实现：`pkg/ipsec/tunnel.go` 中的 `(*Tunnel).Create()`
+
+#### 2.2 WireGuard 隧道（现代方式）
+
+**核心特性**：
+- 使用 Curve25519 非对称加密
+- 每端都有自己的密钥对（私钥 + 公钥）
+- 支持服务器/客户端模式
+- 内置加密，无需额外的 IPsec 层
+
+**密钥管理**：
+- 服务器模式：自动生成两端的密钥对，输出完整的对端配置命令
+- 客户端模式：使用服务器提供的私钥和对端公钥
+- 私钥安全存储在配置文件中（`/etc/trueword_node/tunnels/*.yaml`）
+- 对端配置保存在 `/var/lib/trueword_node/peer_configs/`
+
+**握手机制**（重要）：
+- WireGuard 采用"静默协议"，不主动发送握手包
+- 握手由数据包触发（首次需要 5-10 秒）
+- 客户端模式：主动发送 ping 包触发握手
+- 服务器模式：被动等待客户端连接
+- 实现主动握手：`triggerWireGuardHandshake()` 和 `waitForWireGuardHandshake()`
+
+**实现位置**：
+- `pkg/wireguard/tunnel.go` - WireGuard 隧道核心逻辑
+- `pkg/wireguard/keygen.go` - 密钥生成和管理
+- `pkg/ipsec/tunnel_manager.go` - 统一的隧道管理（包含类型分发）
 
 ### 3. 路由表架构
 
@@ -103,7 +136,34 @@ make clean               # 清理构建产物
 
 **注意**：优先级 5 的临时测试路由优先级最高，确保测试流量不受用户策略干扰，但仅在测试期间存在（通过 defer 清理）
 
-### 4. 撤销机制（Rev Commands）
+### 4. 保护路由机制（关键特性）
+
+**问题背景**：
+- 当隧道设置为策略路由出口时，可能导致路由环路
+- 例如：WireGuard 隧道作为默认出口，但握手包本身需要通过物理接口发送
+
+**解决方案**：
+- 优先级10的保护路由确保隧道对端IP的流量不走策略路由
+- 规则：`ip rule add to <对端IP> lookup main pref 10`
+- 这保证隧道底层连接始终通过正确的物理接口
+
+**动态IP容错**（重要）：
+- 配置文件中的 `ProtectedIP` 字段记录当前保护的IP
+- `policy sync-protection` 命令自动检测IP变化并更新
+- 适合 WireGuard 服务器接收动态IP客户端的场景
+- 自动清理僵尸规则（无对应隧道的保护路由）
+
+**自动同步机制**：
+- `policy apply` → 自动执行 `sync-protection`
+- `line start` → 启动后自动执行 `sync-protection`
+- `line start-all` → 批量启动后自动执行 `sync-protection`
+- 用户也可配置 cron 定时任务：`*/5 * * * * twnode policy sync-protection`
+
+**实现位置**：
+- `pkg/routing/policy.go` 中的 `SyncProtection()` 函数
+- `pkg/wireguard/tunnel.go` 中的 `GetWireGuardPeerEndpoint()` 函数（获取运行时对端IP）
+
+### 5. 撤销机制（Rev Commands）
 
 所有网络操作都会记录对应的撤销命令到 `/var/lib/trueword_node/rev/`：
 
@@ -111,9 +171,11 @@ make clean               # 清理构建产物
 - 每个 IPsec 连接的撤销文件：`<ip1>-<ip2>.rev`
 - 删除时自动执行撤销命令，确保干净清理
 
-实现：`pkg/ipsec/tunnel.go` 中的 `recordRevCommands()` 和 `executeRevCommands()`
+实现：
+- `pkg/ipsec/tunnel.go` 中的 `recordRevCommands()` 和 `executeRevCommands()`
+- `pkg/wireguard/tunnel.go` 中的 WireGuard 撤销逻辑
 
-### 5. 配置文件结构
+### 6. 配置文件结构
 
 ```
 /etc/trueword_node/
@@ -128,9 +190,12 @@ make clean               # 清理构建产物
     └── group2.json
 
 /var/lib/trueword_node/
-└── rev/
-    ├── tun01.rev                # 隧道撤销命令
-    └── 1.2.3.4-5.6.7.8.rev     # IPsec撤销命令
+├── rev/
+│   ├── tun01.rev                # 隧道撤销命令
+│   └── 1.2.3.4-5.6.7.8.rev     # IPsec撤销命令
+├── peer_configs/
+│   └── tunnel_name.txt          # WireGuard 对端配置命令
+└── check_results.json           # 连通性检查结果
 ```
 
 ## 重要工作流程
@@ -173,6 +238,49 @@ twnode line create <parent_interface> <remote_ip> <remote_vip> <local_vip> [tunn
 实现：
 - `cmd/main.go` - CLI 交互和命令解析
 - `pkg/ipsec/tunnel_manager.go` - 核心创建逻辑
+
+### WireGuard 隧道创建流程 (line create --type wireguard)
+
+**服务器模式**（自动生成所有密钥）：
+```bash
+twnode line create eth0 0.0.0.0 10.0.0.2 10.0.0.1 tunnel_ab \
+  --type wireguard \
+  --mode server \
+  --listen-port 51820
+```
+
+**内部流程**：
+1. 为本地（服务器）生成密钥对：私钥A + 公钥A
+2. 为对端（客户端）生成密钥对：私钥B + 公钥B
+3. 配置本地 WireGuard 接口（使用私钥A，对端公钥B）
+4. **输出完整的对端创建命令**（包含私钥B和公钥A）
+5. 保存对端配置到 `/var/lib/trueword_node/peer_configs/<name>.txt`
+
+**客户端模式**（使用服务器提供的密钥）：
+```bash
+# 复制服务器输出的完整命令，替换 <父接口>
+twnode line create eth0 192.168.1.100 10.0.0.1 10.0.0.2 tunnel_ab \
+  --type wireguard \
+  --mode client \
+  --private-key 'aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ5aB6cD8e=' \
+  --peer-pubkey 'xY9zA0bC1dE2fG3hI4jK5lM6nO7pQ8rS9tU0vW1xY2zA4=' \
+  --peer-port 51820
+```
+
+**获取对端配置命令**：
+```bash
+twnode line show-peer <tunnel_name>
+```
+
+**重要注意事项**：
+- 服务器模式 `remote_ip` 使用 `0.0.0.0`（占位符）
+- 客户端首次连接后，服务器通过 `wg show` 获取实际对端IP
+- 动态IP场景依赖 `policy sync-protection` 自动更新保护路由
+
+实现：
+- `pkg/wireguard/tunnel.go` - WireGuard 隧道创建
+- `pkg/wireguard/keygen.go` - 密钥生成
+- `cmd/main.go` - CLI 参数处理和对端配置输出
 
 ### 策略路由流程 (policy)
 
@@ -217,6 +325,55 @@ twnode policy set-priority <group_name> <new_priority>
 4. 自动切换策略组或默认路由到最佳出口
 
 实现：`pkg/routing/policy.go`
+
+### 保护路由同步流程 (policy sync-protection)
+
+**核心功能**：
+- 检测隧道对端IP变化并自动更新保护路由
+- 添加缺失的保护路由（新隧道或未保护的隧道）
+- 清理僵尸规则（无对应隧道的保护路由）
+
+**执行方式**：
+```bash
+# 手动执行
+twnode policy sync-protection
+
+# Cron 定时任务（推荐）
+*/5 * * * * /usr/local/bin/twnode policy sync-protection >/dev/null 2>&1
+```
+
+**自动调用时机**：
+- `policy apply` 开始前
+- `line start <name>` 完成后
+- `line start-all` 完成后
+
+**工作流程**：
+1. 加载所有隧道配置
+2. 对每个隧道：
+   - GRE 隧道：从配置文件读取 `RemoteIP`
+   - WireGuard 客户端：从配置文件读取 `RemoteIP`
+   - WireGuard 服务器：通过 `wg show <interface> endpoints` 获取实际对端IP
+3. 检查 `ProtectedIP` 字段，如果IP变化：
+   - 删除旧保护路由：`ip rule del to <旧IP> pref 10`
+   - 添加新保护路由：`ip rule add to <新IP> lookup main pref 10`
+   - 更新配置文件中的 `ProtectedIP`
+4. 扫描所有优先级10的规则，清理无对应隧道的规则
+
+**动态IP场景示例**：
+```
+同步保护路由...
+  ℹ 从运行状态检测到 WireGuard 隧道 hk-tw 的对端IP: 103.118.40.121
+  ⚠ WireGuard 隧道 hk-tw 对端IP已变化: 1.2.3.4 → 103.118.40.121
+  ✓ 保护 GRE 隧道 tun01 的远程IP 192.168.1.100
+  清理 1 个僵尸规则...
+  ✓ 已清理僵尸规则: 5.6.7.8
+  已更新 1 个隧道的保护路由
+✓ 保护路由同步完成
+```
+
+实现：
+- `pkg/routing/policy.go` 中的 `SyncProtection()` 函数
+- `pkg/wireguard/tunnel.go` 中的 `GetWireGuardPeerEndpoint()` 函数
 
 ## 关键技术细节
 
