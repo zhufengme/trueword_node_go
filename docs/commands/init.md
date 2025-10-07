@@ -51,6 +51,13 @@ sudo twnode init
 sysctl -w net.ipv4.ip_forward=1
 ```
 
+**情况 1：已持久化**（检测到配置文件存在）
+```
+✓ IP转发已启用（当前会话）
+✓ 已持久化（/etc/sysctl.d/99-trueword-node.conf）
+```
+
+**情况 2：未持久化**（配置文件不存在，询问用户）
 ```
 ✓ IP转发已启用（当前会话）
 
@@ -62,6 +69,7 @@ sysctl -w net.ipv4.ip_forward=1
 - 创建文件：`/etc/sysctl.d/99-trueword-node.conf`
 - 内容：`net.ipv4.ip_forward = 1`
 - 系统重启后自动加载
+- **下次运行 init 时自动检测，不再重复询问**
 
 ### 4. 配置 iptables MASQUERADE
 
@@ -72,6 +80,19 @@ sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -j MASQUERADE
 ```
 
+**情况 1：已持久化**（检测到 systemd service 已启用）
+```
+✓ iptables MASQUERADE已配置（当前会话）
+✓ 已持久化（systemd service已启用）
+```
+
+**情况 2：Service 存在但未启用**（配置异常）
+```
+✓ iptables MASQUERADE已配置（当前会话）
+⚠️  systemd service存在但未启用，建议重新配置
+```
+
+**情况 3：未持久化**（service 文件不存在，询问用户）
 ```
 ✓ iptables MASQUERADE已配置（当前会话）
 
@@ -84,6 +105,7 @@ iptables -t nat -A POSTROUTING -j MASQUERADE
 - 创建 systemd service：`/etc/systemd/system/twnode-iptables.service`
 - 启用开机自启：`systemctl enable twnode-iptables.service`
 - 系统启动时自动应用 iptables 规则
+- **下次运行 init 时自动检测，不再重复询问**
 
 ### 5. 处理旧配置
 
@@ -383,6 +405,22 @@ sudo systemctl start twnode-iptables.service
 ```
 
 ## 持久化配置说明
+
+### 智能检测机制
+
+**重复运行 init 时不会重复询问**：
+
+系统会自动检测持久化状态：
+- **IP 转发**：检查 `/etc/sysctl.d/99-trueword-node.conf` 是否存在
+- **iptables 规则**：检查 systemd service 是否已启用
+
+如果已经持久化，会直接显示"✓ 已持久化"，不再询问用户。
+
+**好处**：
+- ✅ 避免重复配置
+- ✅ 避免重复询问
+- ✅ 用户体验更友好
+- ✅ 可安全多次运行 init
 
 ### 为什么需要持久化？
 

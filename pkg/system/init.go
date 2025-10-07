@@ -209,24 +209,30 @@ func Initialize() error {
 	}
 	fmt.Println("  ✓ IP转发已启用（当前会话）")
 
-	// 询问是否持久化IP转发
-	fmt.Println()
-	fmt.Println("  ℹ️  IP转发配置是临时的，重启后会失效")
-	fmt.Print("  是否持久化到系统配置? (Y/n): ")
-	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	if response == "" || response == "y" || response == "yes" {
-		sysctlConf := "/etc/sysctl.d/99-trueword-node.conf"
-		content := "# TrueWord Node Configuration\nnet.ipv4.ip_forward = 1\n"
-		if err := os.WriteFile(sysctlConf, []byte(content), 0644); err != nil {
-			fmt.Printf("  ⚠️  持久化失败: %v\n", err)
-		} else {
-			fmt.Printf("  ✓ 已持久化到 %s\n", sysctlConf)
-		}
+	// 检查IP转发是否已持久化
+	sysctlConf := "/etc/sysctl.d/99-trueword-node.conf"
+	if _, err := os.Stat(sysctlConf); err == nil {
+		// 配置文件已存在
+		fmt.Printf("  ✓ 已持久化（%s）\n", sysctlConf)
 	} else {
-		fmt.Println("  - 已跳过持久化")
+		// 配置文件不存在，询问是否持久化
+		fmt.Println()
+		fmt.Println("  ℹ️  IP转发配置是临时的，重启后会失效")
+		fmt.Print("  是否持久化到系统配置? (Y/n): ")
+		reader := bufio.NewReader(os.Stdin)
+		response, _ := reader.ReadString('\n')
+		response = strings.TrimSpace(strings.ToLower(response))
+
+		if response == "" || response == "y" || response == "yes" {
+			content := "# TrueWord Node Configuration\nnet.ipv4.ip_forward = 1\n"
+			if err := os.WriteFile(sysctlConf, []byte(content), 0644); err != nil {
+				fmt.Printf("  ⚠️  持久化失败: %v\n", err)
+			} else {
+				fmt.Printf("  ✓ 已持久化到 %s\n", sysctlConf)
+			}
+		} else {
+			fmt.Println("  - 已跳过持久化")
+		}
 	}
 
 	fmt.Println()
@@ -239,22 +245,35 @@ func Initialize() error {
 	}
 	fmt.Println("  ✓ iptables MASQUERADE已配置（当前会话）")
 
-	// 询问是否持久化iptables规则
-	fmt.Println()
-	fmt.Println("  ℹ️  iptables规则是临时的，重启后会失效")
-	fmt.Print("  是否通过systemd持久化? (Y/n): ")
-	response, _ = reader.ReadString('\n')
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	if response == "" || response == "y" || response == "yes" {
-		if err := setupIptablesPersistence(); err != nil {
-			fmt.Printf("  ⚠️  持久化失败: %v\n", err)
-			fmt.Println("  提示: 您可以手动配置 iptables-persistent 或其他持久化方案")
+	// 检查iptables规则是否已持久化
+	servicePath := "/etc/systemd/system/twnode-iptables.service"
+	if _, err := os.Stat(servicePath); err == nil {
+		// Service文件已存在，检查是否已启用
+		cmd := exec.Command("systemctl", "is-enabled", "twnode-iptables.service")
+		if err := cmd.Run(); err == nil {
+			fmt.Println("  ✓ 已持久化（systemd service已启用）")
 		} else {
-			fmt.Println("  ✓ 已通过systemd持久化iptables规则")
+			fmt.Println("  ⚠️  systemd service存在但未启用，建议重新配置")
 		}
 	} else {
-		fmt.Println("  - 已跳过持久化")
+		// Service文件不存在，询问是否持久化
+		fmt.Println()
+		fmt.Println("  ℹ️  iptables规则是临时的，重启后会失效")
+		fmt.Print("  是否通过systemd持久化? (Y/n): ")
+		reader := bufio.NewReader(os.Stdin)
+		response, _ := reader.ReadString('\n')
+		response = strings.TrimSpace(strings.ToLower(response))
+
+		if response == "" || response == "y" || response == "yes" {
+			if err := setupIptablesPersistence(); err != nil {
+				fmt.Printf("  ⚠️  持久化失败: %v\n", err)
+				fmt.Println("  提示: 您可以手动配置 iptables-persistent 或其他持久化方案")
+			} else {
+				fmt.Println("  ✓ 已通过systemd持久化iptables规则")
+			}
+		} else {
+			fmt.Println("  - 已跳过持久化")
+		}
 	}
 
 	fmt.Println()
