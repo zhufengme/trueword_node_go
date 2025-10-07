@@ -49,6 +49,33 @@ func readPassword(prompt string) string {
 	return strings.TrimSpace(string(password))
 }
 
+// isPortAvailable 检查UDP端口是否可用
+func isPortAvailable(port int) bool {
+	addr := fmt.Sprintf(":%d", port)
+	conn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// findAvailablePort 查找可用的端口，从startPort开始
+func findAvailablePort(startPort int) int {
+	for port := startPort; port <= 65535; port++ {
+		if isPortAvailable(port) {
+			return port
+		}
+	}
+	// 如果startPort到65535都被占用，从1024开始再找一次
+	for port := 1024; port < startPort; port++ {
+		if isPortAvailable(port) {
+			return port
+		}
+	}
+	return startPort // 都不行就返回起始端口
+}
+
 // checkWireGuardInstalled 检查 WireGuard 是否安装
 func checkWireGuardInstalled() error {
 	return wireguard.CheckWireGuardInstalled()
@@ -330,8 +357,10 @@ func interactiveCreateWireGuardWithMode(parentInterface string) error {
 
 	if wgMode == "server" {
 		// 服务端模式：需要指定本地监听端口
-		listenPortInput := readInput("\n本地监听端口 (默认51820): ")
-		listenPort = 51820
+		// 查找可用端口，从51820开始
+		defaultPort := findAvailablePort(51820)
+		listenPortInput := readInput(fmt.Sprintf("\n本地监听端口 (默认%d): ", defaultPort))
+		listenPort = defaultPort
 		if listenPortInput != "" {
 			if _, err := fmt.Sscanf(listenPortInput, "%d", &listenPort); err != nil {
 				return fmt.Errorf("端口必须是数字: %w", err)
