@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 和 **WireGuard** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
 
-**当前版本**：v1.2+
+**当前版本**：v1.3
 
 **最新特性**：
+- **init命令智能持久化检测**（自动检测已有配置，避免重复询问）
+- **WireGuard服务器模式自动端口检测**（交互式创建时智能选择可用端口）
 - **完整文档系统**（37个文档，涵盖命令参考、教程和技术参考）
 - **WireGuard 隧道支持**（服务器/客户端模式，完整密钥管理）
 - **动态IP容错机制**（自动检测对端IP变化，智能更新保护路由）
 - **保护路由自动同步**（`policy sync-protection` 命令，适合 cron 定时任务）
+- **跨平台编译脚本**（release.sh，支持4个Linux平台）
 - 策略组优先级自定义（手动指定或自动分配）
 - 优先级调整命令（`policy set-priority`）
 - 优先级冲突检测和验证
@@ -62,6 +65,11 @@ ldd bin/twnode           # 应显示 "not a dynamic executable"
 
 # 安装到系统
 sudo make install
+
+# 跨平台编译（用于发布）
+./release.sh
+# 生成: bin/release/twnode-v{version}-{os}-{arch}.tar.gz
+# 支持平台: linux/amd64, linux/arm64, linux/386, linux/arm
 
 # 开发辅助命令
 make fmt                 # 格式化代码
@@ -126,6 +134,13 @@ make clean               # 清理构建产物
 - 客户端模式：使用服务器提供的私钥和对端公钥
 - 私钥安全存储在配置文件中（`/etc/trueword_node/tunnels/*.yaml`）
 - 对端配置保存在 `/var/lib/trueword_node/peer_configs/`
+
+**端口管理**（v1.3+）：
+- 交互式创建WireGuard服务器隧道时，自动检测可用的UDP端口
+- 从51820开始查找，找到第一个未被占用的端口作为默认值
+- 用户可直接回车使用默认端口，或手动输入其他端口
+- 避免端口冲突导致的创建失败
+- 实现：`cmd/main.go` 中的 `isPortAvailable()` 和 `findAvailablePort()`
 
 **握手机制**（重要）：
 - WireGuard 采用"静默协议"，不主动发送握手包
@@ -231,8 +246,16 @@ make clean               # 清理构建产物
 
 1. 检查 root 权限
 2. 检查必需命令（ip, iptables, ping, sysctl）
-3. 启用 IP 转发（`net.ipv4.ip_forward=1`）
-4. 配置 iptables MASQUERADE
+3. **启用 IP 转发**（`net.ipv4.ip_forward=1`）
+   - 临时启用（当前会话）：`sysctl -w net.ipv4.ip_forward=1`
+   - **智能检测持久化**：检查 `/etc/sysctl.d/99-trueword-node.conf` 是否存在
+   - 如未持久化，询问用户是否需要持久化
+   - 如已持久化，直接显示"✓ 已持久化"，不重复询问
+4. **配置 iptables MASQUERADE**
+   - 临时添加规则（当前会话）：`iptables -t nat -A POSTROUTING -j MASQUERADE`
+   - **智能检测持久化**：检查 systemd service 是否已启用
+   - 如未持久化，询问用户是否需要持久化（通过 systemd service）
+   - 如已持久化，直接显示"✓ 已持久化"，不重复询问
 5. **检查旧配置，如果存在则警告并要求确认（必须输入 "yes"）**
 6. **清除所有旧配置目录**
 7. 重建配置目录结构
@@ -240,7 +263,12 @@ make clean               # 清理构建产物
 9. **交互式选择要管理的物理接口**
 10. 保存物理接口配置到 `/etc/trueword_node/interfaces/physical.yaml`
 
-实现：`pkg/system/init.go` 中的 `Initialize()`
+**持久化机制**：
+- IP转发：写入 `/etc/sysctl.d/99-trueword-node.conf`，系统重启后自动加载
+- iptables规则：创建 systemd service (`twnode-iptables.service`)，开机自动应用规则
+- 智能检测避免重复配置：每次运行 init 时检查持久化状态，已配置则不再询问
+
+实现：`pkg/system/init.go` 中的 `Initialize()` 和 `setupIptablesPersistence()`
 
 ### 隧道创建流程 (line create)
 
