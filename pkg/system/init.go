@@ -62,6 +62,67 @@ func addIptablesRule(table, chain, rule string) error {
 	return cmd.Run()
 }
 
+// setupIptablesPersistence 设置iptables规则持久化
+func setupIptablesPersistence() error {
+	// 1. 创建iptables脚本
+	scriptPath := "/usr/local/bin/twnode-iptables.sh"
+	scriptContent := `#!/bin/bash
+# TrueWord Node iptables 规则
+# 系统启动时自动应用
+
+# 清空可能的重复规则（防止多次运行导致重复）
+iptables -t nat -D POSTROUTING -j MASQUERADE 2>/dev/null || true
+
+# 添加 MASQUERADE 规则
+iptables -t nat -A POSTROUTING -j MASQUERADE
+
+exit 0
+`
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		return fmt.Errorf("创建脚本失败: %w", err)
+	}
+
+	// 2. 创建systemd service
+	servicePath := "/etc/systemd/system/twnode-iptables.service"
+	serviceContent := `[Unit]
+Description=TrueWord Node iptables Rules
+After=network-pre.target
+Before=network.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/twnode-iptables.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+`
+	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
+		return fmt.Errorf("创建systemd service失败: %w", err)
+	}
+
+	// 3. 重载systemd
+	cmd := exec.Command("systemctl", "daemon-reload")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("重载systemd失败: %w", err)
+	}
+
+	// 4. 启用service（开机自启）
+	cmd = exec.Command("systemctl", "enable", "twnode-iptables.service")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("启用service失败: %w", err)
+	}
+
+	// 5. 立即启动service
+	cmd = exec.Command("systemctl", "start", "twnode-iptables.service")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("启动service失败: %w", err)
+	}
+
+	return nil
+}
+
 // CheckEnvironment 检查运行环境
 func CheckEnvironment() error {
 	fmt.Println("检查运行环境...")
@@ -146,14 +207,29 @@ func Initialize() error {
 	if err := setSysctl("net.ipv4.ip_forward", "1"); err != nil {
 		return fmt.Errorf("❌ 启用IP转发失败: %w", err)
 	}
-	fmt.Println("  ✓ IP转发已启用")
+	fmt.Println("  ✓ IP转发已启用（当前会话）")
 
-	// 永久保存
-	sysctlConf := "/etc/sysctl.d/99-trueword-node.conf"
-	content := "# TrueWord Node Configuration\nnet.ipv4.ip_forward = 1\n"
-	if err := os.WriteFile(sysctlConf, []byte(content), 0644); err != nil {
-		fmt.Printf("  ⚠️  警告: 无法持久化配置: %v\n", err)
+	// 询问是否持久化IP转发
+	fmt.Println()
+	fmt.Println("  ℹ️  IP转发配置是临时的，重启后会失效")
+	fmt.Print("  是否持久化到系统配置? (Y/n): ")
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	if response == "" || response == "y" || response == "yes" {
+		sysctlConf := "/etc/sysctl.d/99-trueword-node.conf"
+		content := "# TrueWord Node Configuration\nnet.ipv4.ip_forward = 1\n"
+		if err := os.WriteFile(sysctlConf, []byte(content), 0644); err != nil {
+			fmt.Printf("  ⚠️  持久化失败: %v\n", err)
+		} else {
+			fmt.Printf("  ✓ 已持久化到 %s\n", sysctlConf)
+		}
+	} else {
+		fmt.Println("  - 已跳过持久化")
 	}
+
+	fmt.Println()
 
 	// 4. 配置iptables MASQUERADE
 	if !iptablesRuleExists("nat", "POSTROUTING", "-j MASQUERADE") {
@@ -161,7 +237,26 @@ func Initialize() error {
 			return fmt.Errorf("❌ 添加iptables规则失败: %w", err)
 		}
 	}
-	fmt.Println("  ✓ iptables MASQUERADE已配置")
+	fmt.Println("  ✓ iptables MASQUERADE已配置（当前会话）")
+
+	// 询问是否持久化iptables规则
+	fmt.Println()
+	fmt.Println("  ℹ️  iptables规则是临时的，重启后会失效")
+	fmt.Print("  是否通过systemd持久化? (Y/n): ")
+	response, _ = reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	if response == "" || response == "y" || response == "yes" {
+		if err := setupIptablesPersistence(); err != nil {
+			fmt.Printf("  ⚠️  持久化失败: %v\n", err)
+			fmt.Println("  提示: 您可以手动配置 iptables-persistent 或其他持久化方案")
+		} else {
+			fmt.Println("  ✓ 已通过systemd持久化iptables规则")
+		}
+	} else {
+		fmt.Println("  - 已跳过持久化")
+	}
+
 	fmt.Println()
 
 	// 5. 检查是否存在旧配置，如果存在则警告
