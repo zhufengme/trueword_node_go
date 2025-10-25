@@ -25,7 +25,7 @@ import (
 
 const (
 	// 版本信息
-	Version = "1.4"
+	Version = "1.4.1"
 )
 
 var (

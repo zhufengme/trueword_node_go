@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"trueword_node/pkg/network"
 )
 
 // CheckResult 检查结果
@@ -136,11 +138,36 @@ func (hc *HealthChecker) addTestRoute(target, iface, table string) error {
 	}
 
 	// 步骤2: 在指定路由表中添加到目标的路由
-	// 先删除可能存在的残留路由（忽略错误）
-	exec.Command("ip", "route", "del", target, "dev", iface, "table", table).Run()
+	// 检查是否是物理接口（通过查找配置）
+	ifaceConfig, err := network.LoadInterfaceConfig()
+	var gateway string
+	isPhysical := false
 
-	// 格式: ip route add <target> dev <iface> table <table>
-	cmdRoute := exec.Command("ip", "route", "add", target, "dev", iface, "table", table)
+	if err == nil {
+		for _, physIface := range ifaceConfig.Interfaces {
+			if physIface.Name == iface {
+				isPhysical = true
+				gateway = physIface.Gateway
+				break
+			}
+		}
+	}
+
+	// 先删除可能存在的残留路由（忽略错误）
+	exec.Command("ip", "route", "del", target, "table", table).Run()
+
+	// 添加路由
+	var cmdRoute *exec.Cmd
+	if isPhysical && gateway != "" {
+		// 物理接口：通过网关路由
+		// ip route add <target> via <gateway> dev <iface> table <table>
+		cmdRoute = exec.Command("ip", "route", "add", target, "via", gateway, "dev", iface, "table", table)
+	} else {
+		// 隧道或无网关的P2P连接：直接通过设备路由
+		// ip route add <target> dev <iface> table <table>
+		cmdRoute = exec.Command("ip", "route", "add", target, "dev", iface, "table", table)
+	}
+
 	if output, err := cmdRoute.CombinedOutput(); err != nil {
 		// 如果路由添加失败，需要清理已添加的规则
 		exec.Command("ip", "rule", "del", "to", target, "pref", "5").Run()
@@ -152,8 +179,8 @@ func (hc *HealthChecker) addTestRoute(target, iface, table string) error {
 
 // removeTestRoute 删除临时测试路由规则和路由
 func (hc *HealthChecker) removeTestRoute(target, iface, table string) {
-	// 步骤1: 删除路由 - ip route del <target> dev <iface> table <table>
-	cmdRoute := exec.Command("ip", "route", "del", target, "dev", iface, "table", table)
+	// 步骤1: 删除路由 - ip route del <target> table <table>
+	cmdRoute := exec.Command("ip", "route", "del", target, "table", table)
 	cmdRoute.Run() // 忽略错误
 
 	// 步骤2: 删除路由规则 - ip rule del to <target> pref 5
