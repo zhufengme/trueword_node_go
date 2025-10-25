@@ -174,7 +174,7 @@ func pingWithRoute(targetIP, exitInterface string, count int, timeout int) (avgL
 }
 
 // CheckTunnel 检查单个隧道的连通性
-// targetIPs: 目标IP列表，按顺序测试，成功即返回
+// targetIPs: 目标IP列表，按顺序测试，成功即返回。如果为空，使用对端VIP
 func CheckTunnel(tunnelName string, targetIPs []string) *CheckResult {
 	result := &CheckResult{
 		TunnelName: tunnelName,
@@ -183,11 +183,22 @@ func CheckTunnel(tunnelName string, targetIPs []string) *CheckResult {
 	}
 
 	// 加载隧道配置
-	_, err := LoadTunnelConfig(tunnelName)
+	tunnelConfig, err := LoadTunnelConfig(tunnelName)
 	if err != nil {
 		result.Status = "IDLE"
 		result.ErrorMessage = fmt.Sprintf("加载隧道配置失败: %v", err)
 		return result
+	}
+
+	// 如果没有指定测试IP，使用对端VIP
+	if len(targetIPs) == 0 {
+		if tunnelConfig.RemoteVIP != "" {
+			targetIPs = []string{tunnelConfig.RemoteVIP}
+		} else {
+			result.Status = "IDLE"
+			result.ErrorMessage = "未指定测试IP且隧道配置中无对端VIP"
+			return result
+		}
 	}
 
 	// 检查隧道接口是否存在
@@ -363,6 +374,7 @@ func CheckInterface(interfaceName string, targetIPs []string) *CheckResult {
 }
 
 // CheckAllTunnels 检查所有出口（包括物理接口和隧道）
+// targetIPs: 目标IP列表。如果为空，隧道使用对端VIP，物理接口跳过
 func CheckAllTunnels(targetIPs []string) error {
 	fmt.Println("开始检查所有出口...")
 	fmt.Println()
@@ -374,31 +386,38 @@ func CheckAllTunnels(targetIPs []string) error {
 	}
 
 	totalCount := 0
+	skipPhysicalInterfaces := len(targetIPs) == 0
 
 	// 1. 检查物理接口
 	ifaceConfig, err := LoadInterfaceConfig()
 	if err == nil && len(ifaceConfig.Interfaces) > 0 {
-		fmt.Println("【物理接口】")
-		for _, iface := range ifaceConfig.Interfaces {
-			fmt.Printf("检查接口: %s ... ", iface.Name)
+		if skipPhysicalInterfaces {
+			fmt.Println("【物理接口】")
+			fmt.Println("  ⓘ 未指定测试IP，跳过物理接口检查（物理接口无对端VIP）")
+			fmt.Println()
+		} else {
+			fmt.Println("【物理接口】")
+			for _, iface := range ifaceConfig.Interfaces {
+				fmt.Printf("检查接口: %s ... ", iface.Name)
 
-			result := CheckInterface(iface.Name, targetIPs)
-			allResults.Results[iface.Name] = result
-			totalCount++
+				result := CheckInterface(iface.Name, targetIPs)
+				allResults.Results[iface.Name] = result
+				totalCount++
 
-			// 输出结果
-			switch result.Status {
-			case "UP":
-				fmt.Printf("✓ UP (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
-			case "DOWN":
-				fmt.Printf("✗ DOWN (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
-			case "IDLE":
-				fmt.Printf("- IDLE (未启动)\n")
-			default:
-				fmt.Printf("? 未知\n")
+				// 输出结果
+				switch result.Status {
+				case "UP":
+					fmt.Printf("✓ UP (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
+				case "DOWN":
+					fmt.Printf("✗ DOWN (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
+				case "IDLE":
+					fmt.Printf("- IDLE (未启动)\n")
+				default:
+					fmt.Printf("? 未知\n")
+				}
 			}
+			fmt.Println()
 		}
-		fmt.Println()
 	}
 
 	// 2. 检查隧道
@@ -415,6 +434,10 @@ func CheckAllTunnels(targetIPs []string) error {
 
 		if hasValidTunnel {
 			fmt.Println("【隧道】")
+			if skipPhysicalInterfaces {
+				fmt.Println("  ⓘ 使用各隧道的对端VIP作为测试目标")
+				fmt.Println()
+			}
 			for _, entry := range entries {
 				if !strings.HasSuffix(entry.Name(), ".yaml") {
 					continue
@@ -423,19 +446,24 @@ func CheckAllTunnels(targetIPs []string) error {
 				tunnelName := strings.TrimSuffix(entry.Name(), ".yaml")
 				totalCount++
 
-				fmt.Printf("检查隧道: %s ... ", tunnelName)
-
 				result := CheckTunnel(tunnelName, targetIPs)
 				allResults.Results[tunnelName] = result
 
 				// 输出结果
+				if skipPhysicalInterfaces && result.TargetIP != "" {
+					// 显示使用的对端VIP
+					fmt.Printf("检查隧道: %s (→ %s) ... ", tunnelName, result.TargetIP)
+				} else {
+					fmt.Printf("检查隧道: %s ... ", tunnelName)
+				}
+
 				switch result.Status {
 				case "UP":
 					fmt.Printf("✓ UP (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
 				case "DOWN":
 					fmt.Printf("✗ DOWN (延迟: %.2fms, 丢包: %.0f%%)\n", result.Latency, result.PacketLoss)
 				case "IDLE":
-					fmt.Printf("- IDLE (未启动)\n")
+					fmt.Printf("- IDLE (%s)\n", result.ErrorMessage)
 				default:
 					fmt.Printf("? 未知\n")
 				}

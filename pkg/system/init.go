@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"trueword_node/pkg/config"
+	"trueword_node/pkg/failover"
 	"trueword_node/pkg/network"
 )
 
@@ -443,7 +445,82 @@ func Initialize() error {
 	return nil
 }
 
+// loadDaemonState 加载守护进程状态
+func loadDaemonState() (*failover.RuntimeState, error) {
+	return failover.LoadState()
+}
+
+// mergeDaemonStateToCheckResults 将守护进程状态合并到检查结果
+func mergeDaemonStateToCheckResults(checkResults *network.AllCheckResults, daemonState *failover.RuntimeState) {
+	if daemonState == nil || daemonState.InterfaceStates == nil {
+		return
+	}
+
+	// 用守护进程的状态覆盖检查结果
+	for ifaceName, state := range daemonState.InterfaceStates {
+		// 将守护进程的状态转换为 CheckResult 格式
+		status := "UP"
+		if state.PacketLoss >= 100.0 {
+			status = "DOWN"
+		}
+
+		checkResults.Results[ifaceName] = &network.CheckResult{
+			TunnelName: ifaceName,
+			Status:     status,
+			Latency:    state.Latency,
+			PacketLoss: state.PacketLoss,
+			TargetIP:   state.LastTarget,
+		}
+	}
+
+	// 更新时间为守护进程的最后检查时间
+	// 找到最新的检查时间
+	var latestTime time.Time
+	for _, state := range daemonState.InterfaceStates {
+		if state.LastCheckTime.After(latestTime) {
+			latestTime = state.LastCheckTime
+		}
+	}
+	if !latestTime.IsZero() {
+		checkResults.LastUpdate = latestTime
+	}
+}
+
 // ShowStatus 显示系统状态
+// getActualDefaultRoute 从系统实际读取默认路由出口
+func getActualDefaultRoute() string {
+	// 读取优先级 900 的路由规则
+	cmd := exec.Command("sh", "-c", "ip rule show pref 900 | head -1")
+	output, err := cmd.Output()
+	if err != nil || len(output) == 0 {
+		return "" // 未配置默认路由
+	}
+
+	// 读取路由表 900 中的默认路由
+	tableID := 900
+	cmd = exec.Command("sh", "-c", fmt.Sprintf("ip route show table %d | grep '^default'", tableID))
+	output, err = cmd.Output()
+	if err != nil || len(output) == 0 {
+		return "" // 未找到默认路由
+	}
+
+	// 解析默认路由，提取出口接口
+	// 格式1: default dev tun_hk
+	// 格式2: default via 192.168.1.1 dev eth0
+	line := string(output)
+	parts := strings.Fields(line)
+
+	var exitIface string
+	for i, part := range parts {
+		if part == "dev" && i+1 < len(parts) {
+			exitIface = parts[i+1]
+			break
+		}
+	}
+
+	return exitIface
+}
+
 func ShowStatus() error {
 	fmt.Println()
 	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
@@ -451,7 +528,7 @@ func ShowStatus() error {
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
-	// 加载检查结果
+	// 加载检查结果（line check 命令的结果）
 	checkResults, err := network.LoadCheckResults()
 	if err != nil {
 		checkResults = &network.AllCheckResults{
@@ -459,12 +536,15 @@ func ShowStatus() error {
 		}
 	}
 
-	// 加载配置获取默认路由设置
-	cfg, _ := config.Load()
-	defaultExit := ""
-	if cfg != nil {
-		defaultExit = cfg.Routing.DefaultExit
+	// 尝试加载守护进程的实时状态（优先级更高）
+	daemonState, err := loadDaemonState()
+	if err == nil && daemonState != nil {
+		// 用守护进程的实时状态覆盖 line check 的旧数据
+		mergeDaemonStateToCheckResults(checkResults, daemonState)
 	}
+
+	// 从系统实际读取默认路由（而不是从配置文件）
+	defaultExit := getActualDefaultRoute()
 
 	// 构建并显示接口树
 	roots, err := BuildInterfaceTree(checkResults, defaultExit)

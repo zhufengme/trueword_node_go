@@ -955,6 +955,12 @@ type ExitScore struct {
 
 // calculateBaseScore 计算基础评分（不含成本）
 func calculateBaseScore(latency, packetLoss float64) float64 {
+	// 特殊情况：完全失败（100% 丢包）
+	// 此时接口完全不可达，评分应该为 0
+	if packetLoss >= 100.0 {
+		return 0
+	}
+
 	var score float64
 
 	// 丢包率评分（0-60分）
@@ -971,6 +977,7 @@ func calculateBaseScore(latency, packetLoss float64) float64 {
 	}
 
 	// 延迟评分（0-40分）
+	// 注意：延迟为 0 说明没有成功的 ping，但已经被上面的丢包率检查过滤了
 	if latency < 50 {
 		score += 40
 	} else if latency < 100 {
@@ -1499,4 +1506,29 @@ func SyncProtection() error {
 
 	fmt.Println("✓ 保护路由同步完成")
 	return nil
+}
+
+// ===== 守护进程专用函数 =====
+
+// Failover 对策略组执行 failover（守护进程使用）
+// 静默模式，不打印详细输出，只返回错误
+func Failover(groupName string, candidates []string, checkIP string, force bool) error {
+	pm := NewPolicyManager()
+	return pm.FailoverGroup(groupName, candidates, checkIP)
+}
+
+// FailoverDefaultRoute 对默认路由执行 failover（守护进程使用）
+// 静默模式，不打印详细输出，只返回错误
+func FailoverDefaultRoute(candidates []string, checkIP string, force bool) error {
+	pm := NewPolicyManager()
+	return pm.FailoverDefault(candidates, checkIP)
+}
+
+// PolicyGroupExists 检查策略组是否存在
+func PolicyGroupExists(groupName string) bool {
+	pm := NewPolicyManager()
+	if err := pm.LoadGroup(groupName); err != nil {
+		return false
+	}
+	return pm.groups[groupName] != nil
 }

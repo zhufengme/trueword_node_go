@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"trueword_node/pkg/config"
+	"trueword_node/pkg/failover"
 	"trueword_node/pkg/ipsec"
 	"trueword_node/pkg/network"
 	"trueword_node/pkg/routing"
@@ -1045,20 +1046,28 @@ func main() {
 
 	// 检查隧道
 	lineCheckCmd := &cobra.Command{
-		Use:   "check <ip1>[,ip2,ip3...]",
+		Use:   "check [ip1,ip2,ip3...]",
 		Short: "检查所有隧道的连通性",
-		Long:  "依次ping指定的IP地址，成功则返回。结果保存到缓存文件供status命令使用。",
-		Args:  cobra.ExactArgs(1),
+		Long:  "检查隧道连通性，结果保存到缓存文件供status命令使用。\n不带参数：自动使用对端VIP测试\n带参数：依次ping指定的IP地址，成功则返回",
+		Args:  cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			// 解析IP列表
-			targetIPs := strings.Split(args[0], ",")
-			for i, ip := range targetIPs {
-				targetIPs[i] = strings.TrimSpace(ip)
-			}
+			var targetIPs []string
 
-			if len(targetIPs) == 0 {
-				fmt.Fprintln(os.Stderr, "错误: 必须指定至少一个目标IP")
-				os.Exit(1)
+			if len(args) == 0 {
+				// 不带参数：使用对端VIP作为目标IP
+				fmt.Println("未指定测试IP，将使用对端VIP进行测试")
+				targetIPs = []string{} // 空列表，后续由 CheckAllTunnels 处理
+			} else {
+				// 解析IP列表
+				targetIPs = strings.Split(args[0], ",")
+				for i, ip := range targetIPs {
+					targetIPs[i] = strings.TrimSpace(ip)
+				}
+
+				if len(targetIPs) == 0 {
+					fmt.Fprintln(os.Stderr, "错误: 必须指定至少一个目标IP")
+					os.Exit(1)
+				}
 			}
 
 			if err := network.CheckAllTunnels(targetIPs); err != nil {
@@ -1854,6 +1863,260 @@ func main() {
 		},
 	}
 
+	// ===== Failover 守护进程相关命令 =====
+
+	// failover daemon：启动守护进程
+	var failoverDebugMode bool
+	policyFailoverDaemonCmd := &cobra.Command{
+		Use:   "daemon",
+		Short: "启动故障转移守护进程（仅供 systemd 使用）",
+		Long: `启动故障转移守护进程，监控隧道健康状态并自动切换
+
+此命令仅供 systemd 服务使用，日常管理请使用：
+  - systemctl start twnode-failover
+  - systemctl stop twnode-failover
+  - systemctl status twnode-failover`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// 检查root权限
+			if os.Geteuid() != 0 {
+				fmt.Fprintln(os.Stderr, "错误: 此命令需要 root 权限")
+				os.Exit(1)
+			}
+
+			// 获取PID锁
+			if err := failover.AcquirePIDLock(); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+			defer failover.ReleasePIDLock()
+
+			// 创建守护进程
+			daemon, err := failover.NewFailoverDaemon(failover.DefaultConfigFile, failoverDebugMode)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "创建守护进程失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 运行守护进程
+			if err := daemon.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "守护进程运行失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+	policyFailoverDaemonCmd.Flags().BoolVar(&failoverDebugMode, "debug", false, "调试模式（前台运行，详细日志）")
+
+	// failover init-config：初始化配置文件
+	policyFailoverInitConfigCmd := &cobra.Command{
+		Use:   "init-config",
+		Short: "初始化故障转移守护进程配置文件",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.InitConfig(true); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover validate-config：验证配置文件
+	policyFailoverValidateConfigCmd := &cobra.Command{
+		Use:   "validate-config",
+		Short: "验证故障转移守护进程配置文件",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.ValidateConfig(); err != nil {
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover show-config：显示全局配置
+	policyFailoverShowConfigCmd := &cobra.Command{
+		Use:   "show-config",
+		Short: "显示故障转移守护进程全局配置",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.ShowConfig(); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover set-config：修改全局配置
+	var setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold int
+	var setConfigLogFile string
+	policyFailoverSetConfigCmd := &cobra.Command{
+		Use:   "set-config",
+		Short: "修改故障转移守护进程全局配置",
+		Long: `修改全局配置参数
+
+示例:
+  twnode policy failover set-config --interval 500
+  twnode policy failover set-config --failure-threshold 3
+  twnode policy failover set-config --log-file /var/log/twnode-failover.log`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.SetConfig(setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold, setConfigLogFile); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigInterval, "interval", 0, "检测间隔（毫秒）")
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigFailThreshold, "failure-threshold", 0, "失败阈值（次数）")
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigRecvThreshold, "recovery-threshold", 0, "恢复阈值（次数）")
+	policyFailoverSetConfigCmd.Flags().StringVar(&setConfigLogFile, "log-file", "", "日志文件路径")
+
+	// failover list-monitors：列出所有监控任务
+	policyFailoverListMonitorsCmd := &cobra.Command{
+		Use:   "list-monitors",
+		Short: "列出所有监控任务",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.ListMonitors(); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover add-monitor：添加监控任务
+	var addMonitorType, addMonitorTarget, addMonitorTargetsStr, addMonitorExitsStr string
+	var addMonitorInterval, addMonitorFailThreshold, addMonitorRecvThreshold int
+	policyFailoverAddMonitorCmd := &cobra.Command{
+		Use:   "add-monitor [name]",
+		Short: "添加监控任务",
+		Long: `添加监控任务（交互式或命令行模式）
+
+交互式模式:
+  twnode policy failover add-monitor
+
+命令行模式:
+  twnode policy failover add-monitor my-monitor \\
+    --type policy_group \\
+    --target cn_routes \\
+    --check-targets 114.114.114.114,223.5.5.5 \\
+    --exits tun01,tun02,eth0 \\
+    --interval 300`,
+		Args: cobra.MaximumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// 如果没有提供参数，使用交互式模式
+			if len(args) == 0 {
+				if err := failover.AddMonitorInteractive(); err != nil {
+					fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+
+			// 命令行模式
+			name := args[0]
+			if addMonitorType == "" || addMonitorTarget == "" || addMonitorTargetsStr == "" || addMonitorExitsStr == "" {
+				fmt.Fprintln(os.Stderr, "命令行模式需要指定 --type, --target, --check-targets, --exits 参数")
+				os.Exit(1)
+			}
+
+			checkTargets := strings.Split(addMonitorTargetsStr, ",")
+			for i := range checkTargets {
+				checkTargets[i] = strings.TrimSpace(checkTargets[i])
+			}
+
+			candidateExits := strings.Split(addMonitorExitsStr, ",")
+			for i := range candidateExits {
+				candidateExits[i] = strings.TrimSpace(candidateExits[i])
+			}
+
+			monitor := failover.MonitorConfig{
+				Name:              name,
+				Type:              addMonitorType,
+				Target:            addMonitorTarget,
+				CheckTargets:      checkTargets,
+				CandidateExits:    candidateExits,
+				CheckIntervalMs:   addMonitorInterval,
+				FailureThreshold:  addMonitorFailThreshold,
+				RecoveryThreshold: addMonitorRecvThreshold,
+			}
+
+			if err := failover.AddMonitor(monitor); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorType, "type", "", "类型 (policy_group 或 default_route)")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTarget, "target", "", "目标策略组名称或 default")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTargetsStr, "check-targets", "", "检测目标IP列表（逗号分隔，最多3个）")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorExitsStr, "exits", "", "候选出口列表（逗号分隔）")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorInterval, "interval", 0, "检测间隔（毫秒，可选）")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorFailThreshold, "failure-threshold", 0, "失败阈值（可选）")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorRecvThreshold, "recovery-threshold", 0, "恢复阈值（可选）")
+
+	// failover remove-monitor：删除监控任务
+	var removeMonitorForce bool
+	policyFailoverRemoveMonitorCmd := &cobra.Command{
+		Use:   "remove-monitor <name>",
+		Short: "删除监控任务",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			name := args[0]
+			if err := failover.RemoveMonitor(name, removeMonitorForce); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+	policyFailoverRemoveMonitorCmd.Flags().BoolVar(&removeMonitorForce, "force", false, "强制删除，不询问确认")
+
+	// failover show-monitor：显示监控任务详情
+	policyFailoverShowMonitorCmd := &cobra.Command{
+		Use:   "show-monitor <name>",
+		Short: "显示监控任务详情",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			name := args[0]
+			if err := failover.ShowMonitor(name); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover reload：重载配置
+	policyFailoverReloadCmd := &cobra.Command{
+		Use:   "reload",
+		Short: "重载故障转移守护进程配置",
+		Long: `向守护进程发送 SIGHUP 信号，重新加载配置
+
+等价于: systemctl reload twnode-failover`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.ReloadDaemon(); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// failover status：查看守护进程状态
+	policyFailoverStatusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "查看故障转移守护进程状态",
+		Long: `显示守护进程运行状态、监控任务和最近事件
+
+提示: 也可以使用 systemctl status twnode-failover`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := failover.ShowStatus(); err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+
+	// 将守护进程子命令添加到 failover 命令
+	policyFailoverCmd.AddCommand(
+		policyFailoverDaemonCmd, policyFailoverInitConfigCmd, policyFailoverValidateConfigCmd,
+		policyFailoverShowConfigCmd, policyFailoverSetConfigCmd,
+		policyFailoverListMonitorsCmd, policyFailoverAddMonitorCmd,
+		policyFailoverRemoveMonitorCmd, policyFailoverShowMonitorCmd,
+		policyFailoverReloadCmd, policyFailoverStatusCmd)
+
+	// 将所有命令添加到 policyCmd
 	policyCmd.AddCommand(policyCreateCmd, policyAddCmd, policyImportCmd,
 		policyListCmd, policyDefaultCmd, policyUnsetDefaultCmd,
 		policyApplyCmd, policyRevokeCmd, policyFailoverCmd, policySetPriorityCmd,
