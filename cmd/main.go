@@ -1942,7 +1942,8 @@ func main() {
 	}
 
 	// failover set-config：修改全局配置
-	var setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold int
+	var setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold, setConfigSwitchConfirmCount int
+	var setConfigScoreThreshold float64
 	var setConfigLogFile string
 	policyFailoverSetConfigCmd := &cobra.Command{
 		Use:   "set-config",
@@ -1951,18 +1952,21 @@ func main() {
 
 示例:
   twnode policy failover set-config --interval 500
-  twnode policy failover set-config --failure-threshold 3
+  twnode policy failover set-config --score-threshold 5.0
+  twnode policy failover set-config --switch-confirmation-count 3
   twnode policy failover set-config --log-file /var/log/twnode-failover.log`,
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := failover.SetConfig(setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold, setConfigLogFile); err != nil {
+			if err := failover.SetConfig(setConfigInterval, setConfigFailThreshold, setConfigRecvThreshold, setConfigSwitchConfirmCount, setConfigScoreThreshold, setConfigLogFile); err != nil {
 				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 				os.Exit(1)
 			}
 		},
 	}
 	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigInterval, "interval", 0, "检测间隔（毫秒）")
-	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigFailThreshold, "failure-threshold", 0, "失败阈值（次数）")
-	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigRecvThreshold, "recovery-threshold", 0, "恢复阈值（次数）")
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigFailThreshold, "failure-threshold", 0, "失败阈值（次数）[已废弃]")
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigRecvThreshold, "recovery-threshold", 0, "恢复阈值（次数）[已废弃]")
+	policyFailoverSetConfigCmd.Flags().Float64Var(&setConfigScoreThreshold, "score-threshold", 0, "评分差值阈值（0-100）")
+	policyFailoverSetConfigCmd.Flags().IntVar(&setConfigSwitchConfirmCount, "switch-confirmation-count", 0, "切换确认次数（1-10）")
 	policyFailoverSetConfigCmd.Flags().StringVar(&setConfigLogFile, "log-file", "", "日志文件路径")
 
 	// failover list-monitors：列出所有监控任务
@@ -1979,7 +1983,8 @@ func main() {
 
 	// failover add-monitor：添加监控任务
 	var addMonitorType, addMonitorTarget, addMonitorTargetsStr, addMonitorExitsStr string
-	var addMonitorInterval, addMonitorFailThreshold, addMonitorRecvThreshold int
+	var addMonitorInterval, addMonitorFailThreshold, addMonitorRecvThreshold, addMonitorSwitchConfirmCount int
+	var addMonitorScoreThreshold float64
 	policyFailoverAddMonitorCmd := &cobra.Command{
 		Use:   "add-monitor [name]",
 		Short: "添加监控任务",
@@ -1994,7 +1999,8 @@ func main() {
     --target cn_routes \\
     --check-targets 114.114.114.114,223.5.5.5 \\
     --exits tun01,tun02,eth0 \\
-    --interval 300`,
+    --interval 300 \\
+    --score-threshold 5.0`,
 		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// 如果没有提供参数，使用交互式模式
@@ -2024,14 +2030,16 @@ func main() {
 			}
 
 			monitor := failover.MonitorConfig{
-				Name:              name,
-				Type:              addMonitorType,
-				Target:            addMonitorTarget,
-				CheckTargets:      checkTargets,
-				CandidateExits:    candidateExits,
-				CheckIntervalMs:   addMonitorInterval,
-				FailureThreshold:  addMonitorFailThreshold,
-				RecoveryThreshold: addMonitorRecvThreshold,
+				Name:                    name,
+				Type:                    addMonitorType,
+				Target:                  addMonitorTarget,
+				CheckTargets:            checkTargets,
+				CandidateExits:          candidateExits,
+				CheckIntervalMs:         addMonitorInterval,
+				FailureThreshold:        addMonitorFailThreshold,
+				RecoveryThreshold:       addMonitorRecvThreshold,
+				ScoreThreshold:          addMonitorScoreThreshold,
+				SwitchConfirmationCount: addMonitorSwitchConfirmCount,
 			}
 
 			if err := failover.AddMonitor(monitor); err != nil {
@@ -2045,8 +2053,10 @@ func main() {
 	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTargetsStr, "check-targets", "", "检测目标IP列表（逗号分隔，最多3个）")
 	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorExitsStr, "exits", "", "候选出口列表（逗号分隔）")
 	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorInterval, "interval", 0, "检测间隔（毫秒，可选）")
-	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorFailThreshold, "failure-threshold", 0, "失败阈值（可选）")
-	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorRecvThreshold, "recovery-threshold", 0, "恢复阈值（可选）")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorFailThreshold, "failure-threshold", 0, "失败阈值（可选）[已废弃]")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorRecvThreshold, "recovery-threshold", 0, "恢复阈值（可选）[已废弃]")
+	policyFailoverAddMonitorCmd.Flags().Float64Var(&addMonitorScoreThreshold, "score-threshold", 0, "评分差值阈值（0-100，可选）")
+	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorSwitchConfirmCount, "switch-confirmation-count", 0, "切换确认次数（1-10，可选）")
 
 	// failover remove-monitor：删除监控任务
 	var removeMonitorForce bool

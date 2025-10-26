@@ -67,15 +67,19 @@ daemon:
   # 推荐: 500（毫秒级响应），1000（稳定优先）
   check_interval_ms: 500
 
-  # 连续失败多少次判定为链路Down
-  # 范围: 1-20
-  # 推荐: 3-5（越大越稳定，但响应越慢）
-  failure_threshold: 3
+  # 评分差值阈值（避免频繁切换）
+  # 范围: 0-100
+  # 说明: 新出口评分必须比当前出口高出此阈值才会切换
+  # 推荐: 5.0（平衡稳定性和响应性）
+  # 设为 0 表示任何评分提升都会切换
+  score_threshold: 5.0
 
-  # 连续成功多少次判定为链路Up
-  # 范围: 1-20
-  # 推荐: 3-5
-  recovery_threshold: 3
+  # 切换确认次数（避免网络抖动导致频繁切换）
+  # 范围: 1-10
+  # 说明: 需要连续N次检测都确认需要切换，才真正执行
+  # 推荐: 3（500ms × 3 = 1.5秒确认时间）
+  # 设为 1 表示立即切换（v1.4.1 之前的行为）
+  # switch_confirmation_count: 3
 
   # 日志文件路径（留空则不保存日志）
   # log_file: /var/log/twnode-failover.log
@@ -109,8 +113,8 @@ monitors: []
 #
 #   # 可选: 覆盖全局配置
 #   # check_interval_ms: 300
-#   # failure_threshold: 5
-#   # recovery_threshold: 3
+#   # score_threshold: 10.0
+#   # switch_confirmation_count: 5  # 关键业务可设置更保守的值
 #
 # - name: "monitor-default"
 #   type: "default_route"
@@ -159,8 +163,22 @@ func ShowConfig() error {
 	fmt.Println("╚════════════════════════════════════════╝")
 	fmt.Println()
 	fmt.Printf("检测间隔: %dms\n", config.Daemon.CheckIntervalMs)
-	fmt.Printf("失败阈值: %d 次\n", config.Daemon.FailureThreshold)
-	fmt.Printf("恢复阈值: %d 次\n", config.Daemon.RecoveryThreshold)
+	fmt.Printf("评分阈值: %.1f\n", config.Daemon.ScoreThreshold)
+
+	// 显示切换确认次数（获取实际值，包括默认值）
+	confirmationCount := config.Daemon.SwitchConfirmationCount
+	if confirmationCount == 0 {
+		confirmationCount = 1 // 默认值
+	}
+	fmt.Printf("切换确认次数: %d 次\n", confirmationCount)
+
+	// 仅在配置了废弃字段时显示（向后兼容）
+	if config.Daemon.FailureThreshold > 0 {
+		fmt.Printf("失败阈值: %d 次 [已废弃]\n", config.Daemon.FailureThreshold)
+	}
+	if config.Daemon.RecoveryThreshold > 0 {
+		fmt.Printf("恢复阈值: %d 次 [已废弃]\n", config.Daemon.RecoveryThreshold)
+	}
 	if config.Daemon.LogFile != "" {
 		fmt.Printf("日志文件: %s\n", config.Daemon.LogFile)
 	} else {
@@ -173,7 +191,7 @@ func ShowConfig() error {
 }
 
 // SetConfig 修改全局配置
-func SetConfig(interval, failThreshold, recvThreshold int, logFile string) error {
+func SetConfig(interval, failThreshold, recvThreshold, switchConfirmCount int, scoreThreshold float64, logFile string) error {
 	config, err := LoadConfig(DefaultConfigFile)
 	if err != nil {
 		return err
@@ -182,11 +200,18 @@ func SetConfig(interval, failThreshold, recvThreshold int, logFile string) error
 	if interval > 0 {
 		config.Daemon.CheckIntervalMs = interval
 	}
+	// 废弃参数：仍然支持以保持向后兼容
 	if failThreshold > 0 {
 		config.Daemon.FailureThreshold = failThreshold
 	}
 	if recvThreshold > 0 {
 		config.Daemon.RecoveryThreshold = recvThreshold
+	}
+	if scoreThreshold > 0 {
+		config.Daemon.ScoreThreshold = scoreThreshold
+	}
+	if switchConfirmCount > 0 {
+		config.Daemon.SwitchConfirmationCount = switchConfirmCount
 	}
 	if logFile != "" {
 		config.Daemon.LogFile = logFile
@@ -309,7 +334,7 @@ func AddMonitorInteractive() error {
 		interval, _ = strconv.Atoi(intervalStr)
 	}
 
-	fmt.Print("失败阈值（次数，默认使用全局配置，直接回车跳过）: ")
+	fmt.Print("失败阈值（次数，默认使用全局配置，直接回车跳过）[已废弃]: ")
 	failStr, _ := reader.ReadString('\n')
 	failStr = strings.TrimSpace(failStr)
 	var failThreshold int
@@ -317,7 +342,7 @@ func AddMonitorInteractive() error {
 		failThreshold, _ = strconv.Atoi(failStr)
 	}
 
-	fmt.Print("恢复阈值（次数，默认使用全局配置，直接回车跳过）: ")
+	fmt.Print("恢复阈值（次数，默认使用全局配置，直接回车跳过）[已废弃]: ")
 	recvStr, _ := reader.ReadString('\n')
 	recvStr = strings.TrimSpace(recvStr)
 	var recvThreshold int
@@ -325,16 +350,34 @@ func AddMonitorInteractive() error {
 		recvThreshold, _ = strconv.Atoi(recvStr)
 	}
 
+	fmt.Print("评分差值阈值（0-100，默认使用全局配置，直接回车跳过）: ")
+	scoreStr, _ := reader.ReadString('\n')
+	scoreStr = strings.TrimSpace(scoreStr)
+	var scoreThreshold float64
+	if scoreStr != "" {
+		scoreThreshold, _ = strconv.ParseFloat(scoreStr, 64)
+	}
+
+	fmt.Print("切换确认次数（1-10，默认使用全局配置，直接回车跳过）: ")
+	confirmStr, _ := reader.ReadString('\n')
+	confirmStr = strings.TrimSpace(confirmStr)
+	var switchConfirmCount int
+	if confirmStr != "" {
+		switchConfirmCount, _ = strconv.Atoi(confirmStr)
+	}
+
 	// 添加监控任务
 	monitor := MonitorConfig{
-		Name:              name,
-		Type:              monitorType,
-		Target:            target,
-		CheckTargets:      checkTargets,
-		CandidateExits:    candidateExits,
-		CheckIntervalMs:   interval,
-		FailureThreshold:  failThreshold,
-		RecoveryThreshold: recvThreshold,
+		Name:                    name,
+		Type:                    monitorType,
+		Target:                  target,
+		CheckTargets:            checkTargets,
+		CandidateExits:          candidateExits,
+		CheckIntervalMs:         interval,
+		FailureThreshold:        failThreshold,
+		RecoveryThreshold:       recvThreshold,
+		ScoreThreshold:          scoreThreshold,
+		SwitchConfirmationCount: switchConfirmCount,
 	}
 
 	return AddMonitor(monitor)
@@ -435,17 +478,34 @@ func ShowMonitor(name string) error {
 	} else {
 		fmt.Printf(" (全局配置)\n")
 	}
-	fmt.Printf("  失败阈值: %d 次", monitor.GetFailureThreshold(config.Daemon.FailureThreshold))
-	if monitor.FailureThreshold > 0 {
+	fmt.Printf("  评分阈值: %.1f", monitor.GetScoreThreshold(config.Daemon.ScoreThreshold))
+	if monitor.ScoreThreshold > 0 {
 		fmt.Printf(" (自定义)\n")
 	} else {
 		fmt.Printf(" (全局配置)\n")
 	}
-	fmt.Printf("  恢复阈值: %d 次", monitor.GetRecoveryThreshold(config.Daemon.RecoveryThreshold))
-	if monitor.RecoveryThreshold > 0 {
+	fmt.Printf("  切换确认次数: %d 次", monitor.GetSwitchConfirmationCount(config.Daemon.SwitchConfirmationCount))
+	if monitor.SwitchConfirmationCount > 0 {
 		fmt.Printf(" (自定义)\n")
 	} else {
 		fmt.Printf(" (全局配置)\n")
+	}
+	// 仅在配置了废弃字段时显示
+	if monitor.FailureThreshold > 0 || config.Daemon.FailureThreshold > 0 {
+		fmt.Printf("  失败阈值: %d 次 [已废弃]", monitor.GetFailureThreshold(config.Daemon.FailureThreshold))
+		if monitor.FailureThreshold > 0 {
+			fmt.Printf(" (自定义)\n")
+		} else {
+			fmt.Printf(" (全局配置)\n")
+		}
+	}
+	if monitor.RecoveryThreshold > 0 || config.Daemon.RecoveryThreshold > 0 {
+		fmt.Printf("  恢复阈值: %d 次 [已废弃]", monitor.GetRecoveryThreshold(config.Daemon.RecoveryThreshold))
+		if monitor.RecoveryThreshold > 0 {
+			fmt.Printf(" (自定义)\n")
+		} else {
+			fmt.Printf(" (全局配置)\n")
+		}
 	}
 	fmt.Println()
 

@@ -6,23 +6,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TrueWord Node 是一个 Linux 网络隧道管理工具，用于创建和管理 **GRE over IPsec** 和 **WireGuard** 隧道以及策略路由。该项目从 PHP 重写为 Go，支持分层隧道架构。
 
-**当前版本**：v1.3
+**当前版本**：v1.4+
 
-**最新特性**：
-- **init命令智能持久化检测**（自动检测已有配置，避免重复询问）
-- **WireGuard服务器模式自动端口检测**（交互式创建时智能选择可用端口）
+**最新特性**（v1.4+）：
+- **故障转移守护进程**（毫秒级自动故障转移，支持多任务监控和配置热重载）
+- **切换确认机制**（防止网络抖动导致频繁切换，支持全局和单任务配置）
+- **物理接口检测修复**（守护进程正确检测物理接口状态）
+
+**核心特性**：
+- **GRE over IPsec** 和 **WireGuard** 双隧道技术支持
+- **分层隧道嵌套**（隧道可以作为其他隧道的父接口）
+- **动态IP容错**（自动检测对端IP变化，智能更新保护路由）
+- **保护路由机制**（防止路由环路，优先级10保护隧道底层连接）
+- **智能评分算法**（丢包率60% + 延迟40% - 成本惩罚）
+- **策略路由优先级系统**（5/10/100-899/900多层次优先级）
+- **撤销机制**（所有网络操作可完全回退）
+- **静态编译**（单二进制文件，无依赖）
 - **完整文档系统**（37个文档，涵盖命令参考、教程和技术参考）
-- **WireGuard 隧道支持**（服务器/客户端模式，完整密钥管理）
-- **动态IP容错机制**（自动检测对端IP变化，智能更新保护路由）
-- **保护路由自动同步**（`policy sync-protection` 命令，适合 cron 定时任务）
-- **跨平台编译脚本**（release.sh，支持4个Linux平台）
-- 策略组优先级自定义（手动指定或自动分配）
-- 优先级调整命令（`policy set-priority`）
-- 优先级冲突检测和验证
-- 成本（Cost）机制用于故障转移评分
-- 优化的连通性检查（5% 丢包率精度，4秒测试时间）
-- 使用 tablewriter 库的美观表格显示（完美处理中英文对齐）
-- 策略组列表按优先级排序显示
 
 ## 文档系统
 
@@ -222,6 +222,7 @@ make clean               # 清理构建产物
 ```
 /etc/trueword_node/
 ├── config.yaml                    # 全局配置（默认路由等）
+├── failover_daemon.yaml           # 故障转移守护进程配置（v1.4+）
 ├── interfaces/
 │   └── physical.yaml             # 物理接口配置（init时扫描）
 ├── tunnels/
@@ -237,7 +238,8 @@ make clean               # 清理构建产物
 │   └── 1.2.3.4-5.6.7.8.rev     # IPsec撤销命令
 ├── peer_configs/
 │   └── tunnel_name.txt          # WireGuard 对端配置命令
-└── check_results.json           # 连通性检查结果
+├── check_results.json           # 连通性检查结果
+└── failover_state.json          # 守护进程运行时状态（v1.4+）
 ```
 
 ## 重要工作流程
@@ -430,6 +432,111 @@ twnode policy sync-protection
 - `pkg/routing/policy.go` 中的 `SyncProtection()` 函数
 - `pkg/wireguard/tunnel.go` 中的 `GetWireGuardPeerEndpoint()` 函数
 
+### 故障转移守护进程 (policy failover daemon)（v1.4+）
+
+**核心架构**：守护进程提供毫秒级自动故障转移，监控多个策略组或默认路由的健康状态。
+
+**配置文件格式**（`/etc/trueword_node/failover_daemon.yaml`）：
+```yaml
+daemon:
+  check_interval_ms: 500            # 检测间隔（100-60000ms）
+  score_threshold: 5.0              # 评分差值阈值（触发切换的最小差值）
+  switch_confirmation_count: 3      # 切换确认次数（防抖，默认1）
+  log_file: ""                      # 日志文件路径（留空则不保存）
+
+monitors:
+  - name: "monitor-cn-routes"       # 监控任务名称
+    type: "policy_group"            # 类型：policy_group 或 default_route
+    target: "cn_routes"             # 目标策略组名称或 default
+    check_targets:                  # 检测目标IP（最多3个，按顺序尝试）
+      - "114.114.114.114"
+      - "223.5.5.5"
+    candidate_exits:                # 候选出口列表
+      - "tun01"
+      - "tun02"
+      - "eth0"
+    check_interval_ms: 0            # 可选：覆盖全局检测间隔
+    score_threshold: 0              # 可选：覆盖全局评分阈值
+    switch_confirmation_count: 0    # 可选：覆盖全局确认次数
+```
+
+**重要字段说明**：
+- **check_interval_ms**：检测间隔，推荐 500ms（1秒2次检测）
+- **score_threshold**：评分差值阈值，只有当新出口评分比当前出口高出此值时才触发切换
+- **switch_confirmation_count**（v1.4.1+）：**切换确认次数**，需要连续N次检测都判定需要切换才真正执行
+  - 默认值：1（立即切换，向上兼容）
+  - 推荐值：3（500ms × 3 = 1.5秒确认时间）
+  - 作用：防止网络抖动导致频繁切换
+  - 支持全局配置和单任务覆盖
+- **check_targets**：按顺序尝试，首个成功的IP用于检测（提供容错能力）
+
+**关键机制**：
+
+1. **切换确认机制**（防抖动）：
+   - 检测到需要切换时，确认计数器 +1
+   - 连续 N 次检测都判定需要切换，才真正执行
+   - 中途评分差值不足或当前出口恢复，计数器重置为 0
+   - 日志显示确认进度：`【确认中】切换确认进度: 2/3 (还需 1 次确认)`
+
+2. **物理接口健康检查**：
+   - 物理接口通过 **gateway 路由** 检测（`via <gateway>`）
+   - 隧道接口通过 **设备路由** 检测（`dev <interface>`）
+   - 临时测试路由使用优先级 5（最高，确保不受用户策略干扰）
+   - 检测完成后自动清理测试路由
+
+3. **评分决策**：
+   - 使用与 `line check` 相同的评分算法
+   - 只有当 `新出口评分 - 当前出口评分 >= score_threshold` 时才触发切换
+   - 评分相同时优先保持当前出口（避免无意义切换）
+
+4. **配置热重载**：
+   - 守护进程运行时发送 SIGHUP 信号重载配置
+   - systemd 管理：`sudo systemctl reload twnode-failover`
+   - 不中断现有监控任务
+
+**常用命令**：
+```bash
+# 初始化配置文件
+twnode policy failover init-config
+
+# 验证配置
+twnode policy failover validate-config
+
+# 查看全局配置
+twnode policy failover show-config
+
+# 修改全局配置
+twnode policy failover set-config --interval 500 --score-threshold 5.0 --switch-confirmation-count 3
+
+# 添加监控任务
+twnode policy failover add-monitor <name> \
+  --type policy_group \
+  --target cn_routes \
+  --check-targets 114.114.114.114,223.5.5.5 \
+  --exits tun01,tun02,eth0 \
+  --switch-confirmation-count 5
+
+# 查看监控任务
+twnode policy failover list-monitors
+twnode policy failover show-monitor <name>
+
+# 启动守护进程（调试模式）
+sudo twnode policy failover start-daemon --debug
+
+# systemd 服务管理
+sudo systemctl start twnode-failover
+sudo systemctl enable twnode-failover
+sudo systemctl status twnode-failover
+sudo systemctl reload twnode-failover  # 重载配置
+```
+
+**实现位置**：
+- `pkg/failover/daemon.go` - 守护进程核心逻辑
+- `pkg/failover/health_checker.go` - 健康检查（支持物理接口和隧道接口）
+- `pkg/failover/config.go` - 配置管理和验证
+- `pkg/failover/state_manager.go` - 运行时状态持久化
+- `cmd/main.go` - CLI 命令实现
+
 ## 关键技术细节
 
 ### GRE Key 生成
@@ -513,6 +620,40 @@ ip rule add ...     // 添加规则（中间有时间窗口，流量无法路由
 - 最终评分 = 基础评分 - 成本惩罚
 - 分数越高越好，用于 failover 选择最佳出口
 
+### YAML 配置字段命名规范
+
+**重要**：所有 YAML 配置文件使用 **下划线（_）** 作为单词分隔符，而不是连字符（-）。
+
+**正确示例**：
+```yaml
+daemon:
+  check_interval_ms: 500              # ✓ 正确
+  score_threshold: 5.0                # ✓ 正确
+  switch_confirmation_count: 3        # ✓ 正确
+
+monitors:
+  - name: "test"
+    check_targets: ["8.8.8.8"]        # ✓ 正确
+    candidate_exits: ["eth0"]         # ✓ 正确
+    switch_confirmation_count: 5      # ✓ 正确
+```
+
+**错误示例**：
+```yaml
+daemon:
+  check-interval-ms: 500              # ✗ 错误：使用了连字符
+  switch-confirmation-count: 3        # ✗ 错误：使用了连字符
+```
+
+**Go 结构体标签与 YAML 的映射**：
+```go
+type MonitorConfig struct {
+    SwitchConfirmationCount int `yaml:"switch_confirmation_count"`  // 注意是下划线
+}
+```
+
+如果配置文件中使用连字符（如 `switch-confirmation-count`），YAML 解析器将无法正确映射到 Go 结构体，导致字段被忽略或使用默认值。
+
 ## UI 设计原则
 
 - 命令执行时**不显示具体命令**，只显示结果
@@ -586,12 +727,72 @@ require (
 )
 ```
 
+## 常见问题和解决方案
+
+### 1. 守护进程读取的配置值不正确
+
+**症状**：配置文件中设置了 monitor 级别的参数（如 `switch_confirmation_count`），但守护进程运行时使用的是全局配置值。
+
+**原因**：YAML 字段名使用了连字符（-）而不是下划线（_）。
+
+**错误示例**：
+```yaml
+monitors:
+  - name: "default"
+    switch-confirmation-count: 5   # ✗ 错误：使用了连字符
+```
+
+**正确示例**：
+```yaml
+monitors:
+  - name: "default"
+    switch_confirmation_count: 5   # ✓ 正确：使用下划线
+```
+
+**验证方法**：
+```bash
+# 查看监控任务详情，确认字段是否正确读取
+sudo twnode policy failover show-monitor <monitor_name>
+```
+
+### 2. 守护进程检测物理接口总是 DOWN
+
+**症状**：守护进程检测物理接口时显示 DOWN，但手动 `line check` 或 `policy failover` 正常。
+
+**原因**：v1.4.0 版本的 bug，已在 v1.4.1 修复。守护进程未正确使用物理接口的 gateway 路由。
+
+**解决方案**：
+- 升级到 v1.4.1 或更高版本
+- v1.4.1+ 版本中，健康检查器会自动读取物理接口配置并使用正确的路由方式
+
+### 3. 网络抖动导致频繁切换
+
+**症状**：守护进程频繁切换出口，导致网络不稳定。
+
+**原因**：未设置切换确认次数，或阈值设置过低。
+
+**解决方案**（v1.4.1+）：
+```yaml
+daemon:
+  switch_confirmation_count: 3  # 全局默认：需要连续3次确认
+  score_threshold: 5.0          # 评分差值至少5分才触发
+
+monitors:
+  - name: "critical-service"
+    switch_confirmation_count: 5  # 关键业务：需要连续5次确认
+```
+
+**推荐配置**：
+- 检测间隔 500ms + 确认次数 3 = 1.5秒确认时间
+- 关键业务可设置更高的确认次数（5-10）
+
 ## 测试注意事项
 
 - 所有网络操作需要 **root 权限**
 - 测试环境需要 Linux 内核支持 GRE 和 XFRM
 - 测试前运行 `sudo twnode init` 初始化环境
 - 清理测试环境：删除测试隧道，运行 `twnode policy revoke`
+- 测试守护进程时使用 `--debug` 参数查看详细日志
 
 ## 开发规范
 

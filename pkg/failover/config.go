@@ -21,24 +21,26 @@ type FailoverConfig struct {
 
 // DaemonConfig 全局配置
 type DaemonConfig struct {
-	CheckIntervalMs    int     `yaml:"check_interval_ms"`
-	FailureThreshold   int     `yaml:"failure_threshold"`
-	RecoveryThreshold  int     `yaml:"recovery_threshold"`
-	ScoreThreshold     float64 `yaml:"score_threshold"` // 评分差值阈值（避免频繁切换）
-	LogFile            string  `yaml:"log_file"`
+	CheckIntervalMs           int     `yaml:"check_interval_ms"`
+	FailureThreshold          int     `yaml:"failure_threshold"`
+	RecoveryThreshold         int     `yaml:"recovery_threshold"`
+	ScoreThreshold            float64 `yaml:"score_threshold"`            // 评分差值阈值（避免频繁切换）
+	SwitchConfirmationCount   int     `yaml:"switch_confirmation_count"`  // 切换确认次数（默认1）
+	LogFile                   string  `yaml:"log_file"`
 }
 
 // MonitorConfig 监控任务配置
 type MonitorConfig struct {
-	Name               string   `yaml:"name"`
-	Type               string   `yaml:"type"` // policy_group 或 default_route
-	Target             string   `yaml:"target"`
-	CheckTargets       []string `yaml:"check_targets"`
-	CandidateExits     []string `yaml:"candidate_exits"`
-	CheckIntervalMs    int      `yaml:"check_interval_ms"`    // 可选，覆盖全局配置
-	FailureThreshold   int      `yaml:"failure_threshold"`    // 可选，覆盖全局配置
-	RecoveryThreshold  int      `yaml:"recovery_threshold"`   // 可选，覆盖全局配置
-	ScoreThreshold     float64  `yaml:"score_threshold"`      // 可选，覆盖全局配置
+	Name                    string   `yaml:"name"`
+	Type                    string   `yaml:"type"` // policy_group 或 default_route
+	Target                  string   `yaml:"target"`
+	CheckTargets            []string `yaml:"check_targets"`
+	CandidateExits          []string `yaml:"candidate_exits"`
+	CheckIntervalMs         int      `yaml:"check_interval_ms"`          // 可选，覆盖全局配置
+	FailureThreshold        int      `yaml:"failure_threshold"`          // 可选，覆盖全局配置
+	RecoveryThreshold       int      `yaml:"recovery_threshold"`         // 可选，覆盖全局配置
+	ScoreThreshold          float64  `yaml:"score_threshold"`            // 可选，覆盖全局配置
+	SwitchConfirmationCount int      `yaml:"switch_confirmation_count"`  // 可选，覆盖全局配置
 }
 
 // GetCheckInterval 获取检测间隔（优先使用局部配置）
@@ -73,6 +75,17 @@ func (m *MonitorConfig) GetScoreThreshold(globalThreshold float64) float64 {
 	return globalThreshold
 }
 
+// GetSwitchConfirmationCount 获取切换确认次数
+func (m *MonitorConfig) GetSwitchConfirmationCount(globalCount int) int {
+	if m.SwitchConfirmationCount > 0 {
+		return m.SwitchConfirmationCount
+	}
+	if globalCount > 0 {
+		return globalCount
+	}
+	return 1 // 默认值：1（向上兼容）
+}
+
 // Equals 比较两个MonitorConfig是否相等
 func (m *MonitorConfig) Equals(other *MonitorConfig) bool {
 	if m.Name != other.Name || m.Type != other.Type || m.Target != other.Target {
@@ -94,6 +107,9 @@ func (m *MonitorConfig) Equals(other *MonitorConfig) bool {
 		return false
 	}
 	if m.ScoreThreshold != other.ScoreThreshold {
+		return false
+	}
+	if m.SwitchConfirmationCount != other.SwitchConfirmationCount {
 		return false
 	}
 	return true
@@ -138,14 +154,25 @@ func (config *FailoverConfig) Validate() error {
 	if config.Daemon.CheckIntervalMs < 100 || config.Daemon.CheckIntervalMs > 60000 {
 		errors = append(errors, "daemon.check_interval_ms 必须在 100-60000 范围内")
 	}
-	if config.Daemon.FailureThreshold < 1 || config.Daemon.FailureThreshold > 20 {
-		errors = append(errors, "daemon.failure_threshold 必须在 1-20 范围内")
+	// failure_threshold 和 recovery_threshold 已废弃（v1.4），仅在设置时验证范围
+	if config.Daemon.FailureThreshold != 0 {
+		if config.Daemon.FailureThreshold < 1 || config.Daemon.FailureThreshold > 20 {
+			errors = append(errors, "daemon.failure_threshold 必须在 1-20 范围内（已废弃，建议删除）")
+		}
 	}
-	if config.Daemon.RecoveryThreshold < 1 || config.Daemon.RecoveryThreshold > 20 {
-		errors = append(errors, "daemon.recovery_threshold 必须在 1-20 范围内")
+	if config.Daemon.RecoveryThreshold != 0 {
+		if config.Daemon.RecoveryThreshold < 1 || config.Daemon.RecoveryThreshold > 20 {
+			errors = append(errors, "daemon.recovery_threshold 必须在 1-20 范围内（已废弃，建议删除）")
+		}
 	}
 	if config.Daemon.ScoreThreshold < 0 || config.Daemon.ScoreThreshold > 100 {
 		errors = append(errors, "daemon.score_threshold 必须在 0-100 范围内")
+	}
+	// 切换确认次数验证（如果为0则设置默认值1）
+	if config.Daemon.SwitchConfirmationCount == 0 {
+		config.Daemon.SwitchConfirmationCount = 1 // 默认值，向上兼容
+	} else if config.Daemon.SwitchConfirmationCount < 1 || config.Daemon.SwitchConfirmationCount > 10 {
+		errors = append(errors, "daemon.switch_confirmation_count 必须在 1-10 范围内")
 	}
 
 	// 验证每个monitor
@@ -195,19 +222,25 @@ func (config *FailoverConfig) Validate() error {
 				errors = append(errors, prefix+".check_interval_ms 必须在 100-60000 范围内")
 			}
 		}
+		// failure_threshold 和 recovery_threshold 已废弃（v1.4）
 		if monitor.FailureThreshold != 0 {
 			if monitor.FailureThreshold < 1 || monitor.FailureThreshold > 20 {
-				errors = append(errors, prefix+".failure_threshold 必须在 1-20 范围内")
+				errors = append(errors, prefix+".failure_threshold 必须在 1-20 范围内（已废弃，建议删除）")
 			}
 		}
 		if monitor.RecoveryThreshold != 0 {
 			if monitor.RecoveryThreshold < 1 || monitor.RecoveryThreshold > 20 {
-				errors = append(errors, prefix+".recovery_threshold 必须在 1-20 范围内")
+				errors = append(errors, prefix+".recovery_threshold 必须在 1-20 范围内（已废弃，建议删除）")
 			}
 		}
 		if monitor.ScoreThreshold != 0 {
 			if monitor.ScoreThreshold < 0 || monitor.ScoreThreshold > 100 {
 				errors = append(errors, prefix+".score_threshold 必须在 0-100 范围内")
+			}
+		}
+		if monitor.SwitchConfirmationCount != 0 {
+			if monitor.SwitchConfirmationCount < 1 || monitor.SwitchConfirmationCount > 10 {
+				errors = append(errors, prefix+".switch_confirmation_count 必须在 1-10 范围内")
 			}
 		}
 	}

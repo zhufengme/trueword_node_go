@@ -16,15 +16,16 @@ import (
 
 // FailoverDaemon 故障转移守护进程
 type FailoverDaemon struct {
-	config         *FailoverConfig
-	configFile     string
-	logger         *Logger
-	healthChecker  *HealthChecker
-	stateManager   *StateManager
-	failoverMutex  sync.Mutex
-	stopChan       chan struct{}
-	tickers        map[string]*time.Ticker
-	currentExits   map[string]string // monitor_name -> current_exit
+	config               *FailoverConfig
+	configFile           string
+	logger               *Logger
+	healthChecker        *HealthChecker
+	stateManager         *StateManager
+	failoverMutex        sync.Mutex
+	stopChan             chan struct{}
+	tickers              map[string]*time.Ticker
+	currentExits         map[string]string // monitor_name -> current_exit
+	confirmationCounters map[string]int    // monitor_name -> 当前确认次数
 }
 
 // NewFailoverDaemon 创建守护进程
@@ -53,14 +54,15 @@ func NewFailoverDaemon(configFile string, debugMode bool) (*FailoverDaemon, erro
 	stateManager := NewStateManager()
 
 	daemon := &FailoverDaemon{
-		config:        config,
-		configFile:    configFile,
-		logger:        logger,
-		healthChecker: healthChecker,
-		stateManager:  stateManager,
-		stopChan:      make(chan struct{}),
-		tickers:       make(map[string]*time.Ticker),
-		currentExits:  make(map[string]string),
+		config:               config,
+		configFile:           configFile,
+		logger:               logger,
+		healthChecker:        healthChecker,
+		stateManager:         stateManager,
+		stopChan:             make(chan struct{}),
+		tickers:              make(map[string]*time.Ticker),
+		currentExits:         make(map[string]string),
+		confirmationCounters: make(map[string]int),
 	}
 
 	return daemon, nil
@@ -355,65 +357,51 @@ func (d *FailoverDaemon) evaluateFailover(monitor *MonitorConfig) {
 
 		// 检查评分差值是否超过阈值
 		if scoreDiff < scoreThreshold {
-			d.logger.Debug("【保持不变】评分提升 %.1f 未超过阈值 %.1f，不切换",
-				scoreDiff, scoreThreshold)
+			// 评分差值不足，重置确认计数器
+			if d.confirmationCounters[monitor.Name] > 0 {
+				d.logger.Info("【确认取消】评分差值不足，重置确认计数器 (之前: %d/%d)",
+					d.confirmationCounters[monitor.Name],
+					monitor.GetSwitchConfirmationCount(d.config.Daemon.SwitchConfirmationCount))
+				d.confirmationCounters[monitor.Name] = 0
+			} else {
+				d.logger.Debug("【保持不变】评分提升 %.1f 未超过阈值 %.1f，不切换",
+					scoreDiff, scoreThreshold)
+			}
 			return
 		}
+
+		// 需要切换：确认计数器 +1
+		d.confirmationCounters[monitor.Name]++
+		confirmationCount := monitor.GetSwitchConfirmationCount(d.config.Daemon.SwitchConfirmationCount)
+		currentConfirmations := d.confirmationCounters[monitor.Name]
 
 		d.logger.Info("【需要切换】监控任务 %s: %s (%.1f) → %s (%.1f), 评分提升: %.1f (阈值: %.1f)",
 			monitor.Name, currentExit, currentScore, bestExit, bestScore, scoreDiff, scoreThreshold)
 
-		// 双重检测确认（避免网络抖动导致频繁切换）
-		d.logger.Debug("【双重检测】重新检测当前出口和最佳出口...")
-		if !d.doubleCheckFailover(monitor, currentExit, bestExit) {
-			d.logger.Debug("【双重检测失败】取消切换")
-			return
+		// 检查是否达到确认次数
+		if currentConfirmations >= confirmationCount {
+			// 确认完成，执行切换
+			d.logger.Info("【确认完成】连续 %d 次确认通过，执行切换", currentConfirmations)
+			d.confirmationCounters[monitor.Name] = 0 // 重置计数器
+			d.executeFailover(monitor, currentExit, bestExit, currentScore, bestScore)
+		} else {
+			// 还需要更多确认
+			remaining := confirmationCount - currentConfirmations
+			d.logger.Info("【确认中】切换确认进度: %d/%d (还需 %d 次确认)",
+				currentConfirmations, confirmationCount, remaining)
 		}
-
-		// 执行故障转移
-		d.executeFailover(monitor, currentExit, bestExit, currentScore, bestScore)
 	} else {
-		d.logger.Debug("【保持不变】监控任务 %s: %s 仍是最佳出口 (评分: %.1f)",
-			monitor.Name, currentExit, bestScore)
+		// 当前出口仍是最佳出口，重置确认计数器
+		if d.confirmationCounters[monitor.Name] > 0 {
+			d.logger.Info("【确认取消】当前出口恢复为最佳，重置确认计数器 (之前: %d/%d)",
+				d.confirmationCounters[monitor.Name],
+				monitor.GetSwitchConfirmationCount(d.config.Daemon.SwitchConfirmationCount))
+			d.confirmationCounters[monitor.Name] = 0
+		} else {
+			d.logger.Debug("【保持不变】监控任务 %s: %s 仍是最佳出口 (评分: %.1f)",
+				monitor.Name, currentExit, bestScore)
+		}
 	}
-}
-
-// doubleCheckFailover 双重检测确认（重新检测当前出口和最佳出口）
-// 返回 true 表示确认需要切换，false 表示取消切换
-func (d *FailoverDaemon) doubleCheckFailover(monitor *MonitorConfig, currentExit, bestExit string) bool {
-	scoreThreshold := monitor.GetScoreThreshold(d.config.Daemon.ScoreThreshold)
-
-	// 重新检测当前出口
-	currentResult := d.healthChecker.CheckInterface(currentExit, monitor.CheckTargets)
-	currentCost := d.getExitCost(currentExit)
-	d.stateManager.UpdateState(currentExit, currentResult, currentCost)
-	currentState := d.stateManager.GetState(currentExit)
-
-	d.logger.Debug("  当前出口 %s: 延迟=%.1fms 丢包=%.0f%% 评分=%.1f",
-		currentExit, currentState.Latency, currentState.PacketLoss, currentState.FinalScore)
-
-	// 重新检测最佳出口
-	bestResult := d.healthChecker.CheckInterface(bestExit, monitor.CheckTargets)
-	bestCost := d.getExitCost(bestExit)
-	d.stateManager.UpdateState(bestExit, bestResult, bestCost)
-	bestState := d.stateManager.GetState(bestExit)
-
-	d.logger.Debug("  最佳出口 %s: 延迟=%.1fms 丢包=%.0f%% 评分=%.1f",
-		bestExit, bestState.Latency, bestState.PacketLoss, bestState.FinalScore)
-
-	// 重新判断是否需要切换
-	scoreDiff := bestState.FinalScore - currentState.FinalScore
-	d.logger.Debug("【双重检测结果】评分差值: %.1f (阈值: %.1f)",
-		scoreDiff, scoreThreshold)
-
-	if scoreDiff < scoreThreshold {
-		d.logger.Debug("【双重检测】评分差值 %.1f 未超过阈值 %.1f，取消切换", scoreDiff, scoreThreshold)
-		return false
-	}
-
-	d.logger.Debug("【双重检测】确认切换: %s (%.1f) → %s (%.1f)",
-		currentExit, currentState.FinalScore, bestExit, bestState.FinalScore)
-	return true
 }
 
 // executeFailover 执行故障转移
