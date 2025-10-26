@@ -230,10 +230,13 @@ func (d *FailoverDaemon) getActualDefaultRoute(monitor *MonitorConfig) (string, 
 func (d *FailoverDaemon) checkMonitor(monitor *MonitorConfig) {
 	d.logger.Debug("【监控任务】%s 开始检查 (候选: %v)", monitor.Name, monitor.CandidateExits)
 
+	// 获取检测间隔（用于自适应ping包数量）
+	checkIntervalMs := monitor.GetCheckInterval(d.config.Daemon.CheckIntervalMs)
+
 	// 检查所有候选出口
 	for _, exit := range monitor.CandidateExits {
-		// 执行健康检查
-		checkResult := d.healthChecker.CheckInterface(exit, monitor.CheckTargets)
+		// 执行健康检查（自适应ping包数量）
+		checkResult := d.healthChecker.CheckInterface(exit, monitor.CheckTargets, checkIntervalMs)
 
 		// 获取成本
 		cost := d.getExitCost(exit)

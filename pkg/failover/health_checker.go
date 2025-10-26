@@ -36,10 +36,11 @@ func NewHealthChecker(logger *Logger) *HealthChecker {
 
 // CheckInterface 检测接口健康状态
 // 返回: 检查结果（包含延迟、丢包率）
-func (hc *HealthChecker) CheckInterface(iface string, targets []string) *CheckResult {
+// checkIntervalMs: 检测间隔（毫秒），用于自适应ping包数量
+func (hc *HealthChecker) CheckInterface(iface string, targets []string, checkIntervalMs int) *CheckResult {
 	// 顺序尝试每个目标IP
 	for i, target := range targets {
-		result := hc.quickPing(iface, target)
+		result := hc.quickPing(iface, target, checkIntervalMs)
 
 		if result.Success {
 			if i > 0 {
@@ -66,9 +67,26 @@ func (hc *HealthChecker) CheckInterface(iface string, targets []string) *CheckRe
 	}
 }
 
-// quickPing 快速ping检测（3个包，约300ms）
+// calculatePingCount 根据检测间隔自动计算ping包数量
+// 500ms → 10个包（10%精度）, 2000ms+ → 20个包（5%精度）
+func (hc *HealthChecker) calculatePingCount(checkIntervalMs int) int {
+	// 公式：count = min(20, max(10, check_interval_ms / 100))
+	count := checkIntervalMs / 100
+
+	if count < 10 {
+		count = 10 // 最少10个包（10%精度）
+	}
+	if count > 20 {
+		count = 20 // 最多20个包（5%精度）
+	}
+
+	return count
+}
+
+// quickPing 自适应ping检测
 // 返回: 检查结果（延迟、丢包率）
-func (hc *HealthChecker) quickPing(iface, target string) *CheckResult {
+// checkIntervalMs: 检测间隔，用于计算最优包数量
+func (hc *HealthChecker) quickPing(iface, target string, checkIntervalMs int) *CheckResult {
 	result := &CheckResult{
 		Interface:  iface,
 		TargetIP:   target,
@@ -94,11 +112,18 @@ func (hc *HealthChecker) quickPing(iface, target string) *CheckResult {
 	// 确保删除（即使 panic 也要删除）
 	defer hc.removeTestRoute(target, iface, table)
 
-	// 执行快速ping: 3个包，间隔0.1秒，超时1秒
+	// 自适应计算ping包数量
+	count := hc.calculatePingCount(checkIntervalMs)
+
+	// 执行自适应ping
+	// 包间隔：0.04秒（40ms）
+	// 总测试时间：count × 0.04秒
+	// 示例：500ms间隔 → 10包 × 0.04s = 0.4s（10%精度）
+	//      2000ms间隔 → 20包 × 0.04s = 0.8s（5%精度）
 	cmd := exec.Command("ping",
-		"-c", "3",   // 发送3个包
-		"-i", "0.1", // 间隔0.1秒
-		"-W", "1",   // 超时1秒
+		"-c", strconv.Itoa(count), // 自适应包数量
+		"-i", "0.04",               // 间隔40ms（提速）
+		"-W", "1",                  // 超时1秒
 		target,
 	)
 
