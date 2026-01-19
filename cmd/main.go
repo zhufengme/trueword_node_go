@@ -1983,6 +1983,7 @@ func main() {
 
 	// failover add-monitor：添加监控任务
 	var addMonitorType, addMonitorTarget, addMonitorTargetsStr, addMonitorExitsStr string
+	var addMonitorCheckMode, addMonitorDNSServersStr, addMonitorDNSQueryDomain string
 	var addMonitorInterval, addMonitorFailThreshold, addMonitorRecvThreshold, addMonitorSwitchConfirmCount int
 	var addMonitorScoreThreshold float64
 	policyFailoverAddMonitorCmd := &cobra.Command{
@@ -1993,13 +1994,25 @@ func main() {
 交互式模式:
   twnode policy failover add-monitor
 
-命令行模式:
+命令行模式（Ping 检测）:
   twnode policy failover add-monitor my-monitor \\
     --type policy_group \\
     --target cn_routes \\
+    --check-mode ping \\
     --check-targets 114.114.114.114,223.5.5.5 \\
     --exits tun01,tun02,eth0 \\
     --interval 300 \\
+    --score-threshold 5.0
+
+命令行模式（DNS 检测）:
+  twnode policy failover add-monitor my-monitor \\
+    --type policy_group \\
+    --target intl_routes \\
+    --check-mode dns \\
+    --dns-servers 1.1.1.1,8.8.8.8 \\
+    --dns-query-domain google.com \\
+    --exits tun_hk,tun_us \\
+    --interval 2000 \\
     --score-threshold 5.0`,
 		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
@@ -2014,14 +2027,42 @@ func main() {
 
 			// 命令行模式
 			name := args[0]
-			if addMonitorType == "" || addMonitorTarget == "" || addMonitorTargetsStr == "" || addMonitorExitsStr == "" {
-				fmt.Fprintln(os.Stderr, "命令行模式需要指定 --type, --target, --check-targets, --exits 参数")
+
+			// 基本参数验证
+			if addMonitorType == "" || addMonitorTarget == "" || addMonitorExitsStr == "" {
+				fmt.Fprintln(os.Stderr, "命令行模式需要指定 --type, --target, --exits 参数")
 				os.Exit(1)
 			}
 
-			checkTargets := strings.Split(addMonitorTargetsStr, ",")
-			for i := range checkTargets {
-				checkTargets[i] = strings.TrimSpace(checkTargets[i])
+			// 根据检测模式验证参数
+			checkMode := addMonitorCheckMode
+			if checkMode == "" {
+				checkMode = "ping" // 默认 ping 模式
+			}
+
+			var checkTargets []string
+			var dnsServers []string
+
+			if checkMode == "dns" {
+				// DNS 模式：需要 dns-servers
+				if addMonitorDNSServersStr == "" {
+					fmt.Fprintln(os.Stderr, "DNS 模式需要指定 --dns-servers 参数")
+					os.Exit(1)
+				}
+				dnsServers = strings.Split(addMonitorDNSServersStr, ",")
+				for i := range dnsServers {
+					dnsServers[i] = strings.TrimSpace(dnsServers[i])
+				}
+			} else {
+				// Ping 模式：需要 check-targets
+				if addMonitorTargetsStr == "" {
+					fmt.Fprintln(os.Stderr, "Ping 模式需要指定 --check-targets 参数")
+					os.Exit(1)
+				}
+				checkTargets = strings.Split(addMonitorTargetsStr, ",")
+				for i := range checkTargets {
+					checkTargets[i] = strings.TrimSpace(checkTargets[i])
+				}
 			}
 
 			candidateExits := strings.Split(addMonitorExitsStr, ",")
@@ -2033,7 +2074,10 @@ func main() {
 				Name:                    name,
 				Type:                    addMonitorType,
 				Target:                  addMonitorTarget,
+				CheckMode:               checkMode,
 				CheckTargets:            checkTargets,
+				DNSServers:              dnsServers,
+				DNSQueryDomain:          addMonitorDNSQueryDomain,
 				CandidateExits:          candidateExits,
 				CheckIntervalMs:         addMonitorInterval,
 				FailureThreshold:        addMonitorFailThreshold,
@@ -2050,7 +2094,10 @@ func main() {
 	}
 	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorType, "type", "", "类型 (policy_group 或 default_route)")
 	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTarget, "target", "", "目标策略组名称或 default")
-	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTargetsStr, "check-targets", "", "检测目标IP列表（逗号分隔，最多3个）")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorCheckMode, "check-mode", "", "检测模式 (ping 或 dns，默认 ping)")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorTargetsStr, "check-targets", "", "检测目标IP列表（逗号分隔，最多3个，ping模式使用）")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorDNSServersStr, "dns-servers", "", "DNS服务器列表（逗号分隔，不限数量，dns模式使用）")
+	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorDNSQueryDomain, "dns-query-domain", "", "DNS查询域名（可选，默认 google.com，dns模式使用）")
 	policyFailoverAddMonitorCmd.Flags().StringVar(&addMonitorExitsStr, "exits", "", "候选出口列表（逗号分隔）")
 	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorInterval, "interval", 0, "检测间隔（毫秒，可选）")
 	policyFailoverAddMonitorCmd.Flags().IntVar(&addMonitorFailThreshold, "failure-threshold", 0, "失败阈值（可选）[已废弃]")

@@ -26,6 +26,8 @@ type DaemonConfig struct {
 	RecoveryThreshold         int     `yaml:"recovery_threshold"`
 	ScoreThreshold            float64 `yaml:"score_threshold"`            // 评分差值阈值（避免频繁切换）
 	SwitchConfirmationCount   int     `yaml:"switch_confirmation_count"`  // 切换确认次数（默认1）
+	CheckMode                 string  `yaml:"check_mode"`                 // 全局默认检测模式：ping / dns
+	DNSQueryDomain            string  `yaml:"dns_query_domain"`           // DNS 查询的默认域名
 	LogFile                   string  `yaml:"log_file"`
 }
 
@@ -34,13 +36,16 @@ type MonitorConfig struct {
 	Name                    string   `yaml:"name"`
 	Type                    string   `yaml:"type"` // policy_group 或 default_route
 	Target                  string   `yaml:"target"`
-	CheckTargets            []string `yaml:"check_targets"`
+	CheckTargets            []string `yaml:"check_targets"`              // ping 模式使用
 	CandidateExits          []string `yaml:"candidate_exits"`
 	CheckIntervalMs         int      `yaml:"check_interval_ms"`          // 可选，覆盖全局配置
 	FailureThreshold        int      `yaml:"failure_threshold"`          // 可选，覆盖全局配置
 	RecoveryThreshold       int      `yaml:"recovery_threshold"`         // 可选，覆盖全局配置
 	ScoreThreshold          float64  `yaml:"score_threshold"`            // 可选，覆盖全局配置
 	SwitchConfirmationCount int      `yaml:"switch_confirmation_count"`  // 可选，覆盖全局配置
+	CheckMode               string   `yaml:"check_mode"`                 // 可选，覆盖全局检测模式：ping / dns
+	DNSServers              []string `yaml:"dns_servers"`                // dns 模式使用
+	DNSQueryDomain          string   `yaml:"dns_query_domain"`           // 可选，覆盖全局查询域名
 }
 
 // GetCheckInterval 获取检测间隔（优先使用局部配置）
@@ -84,6 +89,28 @@ func (m *MonitorConfig) GetSwitchConfirmationCount(globalCount int) int {
 		return globalCount
 	}
 	return 1 // 默认值：1（向上兼容）
+}
+
+// GetCheckMode 获取检测模式（优先使用局部配置）
+func (m *MonitorConfig) GetCheckMode(globalMode string) string {
+	if m.CheckMode != "" {
+		return m.CheckMode
+	}
+	if globalMode != "" {
+		return globalMode
+	}
+	return "ping" // 默认值：ping
+}
+
+// GetDNSQueryDomain 获取 DNS 查询域名（优先使用局部配置）
+func (m *MonitorConfig) GetDNSQueryDomain(globalDomain string) string {
+	if m.DNSQueryDomain != "" {
+		return m.DNSQueryDomain
+	}
+	if globalDomain != "" {
+		return globalDomain
+	}
+	return "google.com" // 默认值
 }
 
 // Equals 比较两个MonitorConfig是否相等
@@ -201,13 +228,31 @@ func (config *FailoverConfig) Validate() error {
 			errors = append(errors, prefix+".target 不能为空")
 		}
 
-		// 检测目标IP（1-3个）
-		if len(monitor.CheckTargets) < 1 || len(monitor.CheckTargets) > 3 {
-			errors = append(errors, prefix+".check_targets 必须有 1-3 个IP")
+		// 检测模式验证
+		checkMode := monitor.GetCheckMode(config.Daemon.CheckMode)
+		if checkMode != "ping" && checkMode != "dns" {
+			errors = append(errors, fmt.Sprintf("%s.check_mode 必须是 'ping' 或 'dns'", prefix))
 		}
-		for j, ip := range monitor.CheckTargets {
-			if net.ParseIP(ip) == nil {
-				errors = append(errors, fmt.Sprintf("%s.check_targets[%d] 不是有效的IP: %s", prefix, j, ip))
+
+		if checkMode == "dns" {
+			// DNS 模式：必须有 dns_servers
+			if len(monitor.DNSServers) < 1 {
+				errors = append(errors, prefix+".dns_servers 至少需要 1 个 DNS 服务器（DNS 模式）")
+			}
+			for j, dnsServer := range monitor.DNSServers {
+				if net.ParseIP(dnsServer) == nil {
+					errors = append(errors, fmt.Sprintf("%s.dns_servers[%d] 不是有效的IP: %s", prefix, j, dnsServer))
+				}
+			}
+		} else {
+			// ping 模式：必须有 check_targets（1-3个）
+			if len(monitor.CheckTargets) < 1 || len(monitor.CheckTargets) > 3 {
+				errors = append(errors, prefix+".check_targets 必须有 1-3 个IP（ping 模式）")
+			}
+			for j, ip := range monitor.CheckTargets {
+				if net.ParseIP(ip) == nil {
+					errors = append(errors, fmt.Sprintf("%s.check_targets[%d] 不是有效的IP: %s", prefix, j, ip))
+				}
 			}
 		}
 

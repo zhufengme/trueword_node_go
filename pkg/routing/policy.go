@@ -366,7 +366,7 @@ func (pm *PolicyManager) ApplyGroup(group *PolicyGroup) error {
 			cmd = fmt.Sprintf("ip route add %s dev %s table %d", cidr, group.Exit, tableID)
 		}
 
-		if err := execIPCommand(cmd); err != nil {
+		if err := execIPRouteAddWithFallback(cmd); err != nil {
 			fmt.Printf("  ✗ IP: %s, 出口: %s - 失败\n", cidr, group.Exit)
 			fmt.Printf("     错误: %v\n", err)
 			fmt.Printf("     命令: %s\n", cmd)
@@ -488,6 +488,26 @@ func (pm *PolicyManager) applyDefaultRoute() error {
 	cmd := fmt.Sprintf("ip route flush table %d", tableID)
 	execIPCommand(cmd)
 
+	// 显式删除所有默认路由（确保清理干净，防止出现多条）
+	for i := 0; i < 5; i++ {
+		// 检查是否还有默认路由
+		checkCmd := exec.Command("sh", "-c", fmt.Sprintf("ip route show table %d | grep '^default'", tableID))
+		output, err := checkCmd.Output()
+		if err != nil || len(output) == 0 {
+			break // 没有默认路由了
+		}
+
+		// 还有默认路由，删除
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		for _, line := range lines {
+			routeParts := strings.Fields(line)
+			if len(routeParts) >= 2 {
+				delCmd := fmt.Sprintf("ip route del %s table %d", strings.Join(routeParts[1:], " "), tableID)
+				execIPCommandNoError(delCmd)
+			}
+		}
+	}
+
 	// 获取接口信息以决定路由命令
 	info, err := network.GetInterfaceInfo(pm.defaultExit)
 	if err != nil {
@@ -513,7 +533,7 @@ func (pm *PolicyManager) applyDefaultRoute() error {
 		routeCmd = fmt.Sprintf("ip route add 0.0.0.0/0 dev %s table %d", pm.defaultExit, tableID)
 	}
 
-	if err := execIPCommand(routeCmd); err != nil {
+	if err := execIPRouteAddWithFallback(routeCmd); err != nil {
 		fmt.Printf("  ✗ 添加默认路由失败\n")
 		fmt.Printf("     错误: %v\n", err)
 		fmt.Printf("     命令: %s\n", routeCmd)
@@ -800,6 +820,28 @@ func execIPCommandNoError(cmd string) {
 	parts := strings.Fields(cmd)
 	command := exec.Command(parts[0], parts[1:]...)
 	command.Run()
+}
+
+// execIPRouteAddWithFallback 执行 ip route add 命令，支持 onlink 容错
+// 适用于网关可能不在同一子网的情况（VPS/云服务器）
+func execIPRouteAddWithFallback(cmd string) error {
+	// 第一次尝试：正常添加路由
+	err := execIPCommand(cmd)
+	if err == nil {
+		return nil
+	}
+
+	// 如果失败且命令包含 "via"（即有网关），尝试添加 onlink 参数
+	if strings.Contains(cmd, " via ") {
+		cmdWithOnlink := cmd + " onlink"
+		err = execIPCommand(cmdWithOnlink)
+		if err == nil {
+			return nil
+		}
+	}
+
+	// 两次都失败，返回原始错误
+	return err
 }
 
 // 获取隧道的远程IP

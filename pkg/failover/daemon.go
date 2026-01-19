@@ -196,10 +196,37 @@ func (d *FailoverDaemon) getActualDefaultRoute(monitor *MonitorConfig) (string, 
 		return "", fmt.Errorf("路由表 %d 中未找到默认路由", tableID)
 	}
 
-	// 解析默认路由，提取出口接口
+	// 检查是否有多条默认路由，如果有则自动清理
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) > 1 {
+		d.logger.Warn("⚠ 检测到路由表 %d 中存在多条默认路由（%d 条），自动清理多余路由", tableID, len(lines))
+		d.logger.Warn("保留第一条: %s", strings.TrimSpace(lines[0]))
+
+		// 自动清理多余的默认路由（保留第一条）
+		for i := 1; i < len(lines); i++ {
+			routeLine := strings.TrimSpace(lines[i])
+			d.logger.Warn("删除第 %d 条: %s", i+1, routeLine)
+
+			// 提取完整路由信息用于删除命令
+			routeParts := strings.Fields(routeLine)
+			if len(routeParts) >= 2 {
+				// 构建删除命令：ip route del <路由参数> table 900
+				delCmd := fmt.Sprintf("ip route del %s table %d", strings.Join(routeParts[1:], " "), tableID)
+				cmd := exec.Command("sh", "-c", delCmd)
+				if err := cmd.Run(); err != nil {
+					d.logger.Error("删除多余默认路由失败: %v (命令: %s)", err, delCmd)
+				} else {
+					d.logger.Info("✓ 已删除多余默认路由: %s", routeLine)
+				}
+			}
+		}
+	}
+
+	// 解析默认路由，提取出口接口（使用第一条）
 	// 格式1: default dev tun_hk
 	// 格式2: default via 192.168.1.1 dev eth0
-	line := string(output)
+	line := strings.TrimSpace(lines[0])
+	d.logger.Debug("读取到默认路由: %s", line)
 	parts := strings.Fields(line)
 
 	var exitIface string
@@ -213,6 +240,8 @@ func (d *FailoverDaemon) getActualDefaultRoute(monitor *MonitorConfig) (string, 
 	if exitIface == "" {
 		return "", fmt.Errorf("无法解析默认路由出口接口")
 	}
+
+	d.logger.Debug("解析得到出口接口: %s", exitIface)
 
 	// 验证出口是否在候选列表中
 	for _, candidate := range monitor.CandidateExits {
@@ -230,13 +259,27 @@ func (d *FailoverDaemon) getActualDefaultRoute(monitor *MonitorConfig) (string, 
 func (d *FailoverDaemon) checkMonitor(monitor *MonitorConfig) {
 	d.logger.Debug("【监控任务】%s 开始检查 (候选: %v)", monitor.Name, monitor.CandidateExits)
 
-	// 获取检测间隔（用于自适应ping包数量）
+	// 获取检测间隔（用于自适应包数量）
 	checkIntervalMs := monitor.GetCheckInterval(d.config.Daemon.CheckIntervalMs)
+
+	// 获取检测模式
+	checkMode := monitor.GetCheckMode(d.config.Daemon.CheckMode)
+
+	// 获取检测目标（ping 模式用 check_targets，dns 模式用 dns_servers）
+	var targets []string
+	var dnsDomain string
+	if checkMode == "dns" {
+		targets = monitor.DNSServers
+		dnsDomain = monitor.GetDNSQueryDomain(d.config.Daemon.DNSQueryDomain)
+	} else {
+		targets = monitor.CheckTargets
+		dnsDomain = "" // ping 模式不使用
+	}
 
 	// 检查所有候选出口
 	for _, exit := range monitor.CandidateExits {
-		// 执行健康检查（自适应ping包数量）
-		checkResult := d.healthChecker.CheckInterface(exit, monitor.CheckTargets, checkIntervalMs)
+		// 执行健康检查（支持 ping 和 dns 模式）
+		checkResult := d.healthChecker.CheckInterface(exit, checkMode, targets, dnsDomain, checkIntervalMs)
 
 		// 获取成本
 		cost := d.getExitCost(exit)
@@ -255,7 +298,7 @@ func (d *FailoverDaemon) checkMonitor(monitor *MonitorConfig) {
 	if !d.stateManager.AllInitialChecksDone(monitor.CandidateExits) {
 		d.logger.Debug("监控任务 %s 还在初始检测阶段，不触发故障转移", monitor.Name)
 		// 保存状态
-		if err := d.stateManager.SaveState(); err != nil {
+		if err := d.stateManager.SaveState(d.currentExits); err != nil {
 			d.logger.Error("保存状态失败: %v", err)
 		}
 		return
@@ -265,7 +308,7 @@ func (d *FailoverDaemon) checkMonitor(monitor *MonitorConfig) {
 	d.evaluateFailover(monitor)
 
 	// 保存状态
-	if err := d.stateManager.SaveState(); err != nil {
+	if err := d.stateManager.SaveState(d.currentExits); err != nil {
 		d.logger.Error("保存状态失败: %v", err)
 	}
 }
@@ -290,8 +333,16 @@ func (d *FailoverDaemon) evaluateFailover(monitor *MonitorConfig) {
 			}
 		} else {
 			// 检查是否与缓存不一致
-			if cachedExit, exists := d.currentExits[monitor.Name]; exists && cachedExit != currentExit {
-				d.logger.Warn("检测到默认路由已被外部修改: %s → %s", cachedExit, currentExit)
+			if cachedExit, exists := d.currentExits[monitor.Name]; exists {
+				// 缓存存在时才检查
+				if cachedExit != currentExit {
+					d.logger.Warn("检测到默认路由已被外部修改: %s → %s", cachedExit, currentExit)
+				} else {
+					d.logger.Debug("默认路由未变化: %s", currentExit)
+				}
+			} else {
+				// 首次读取，不报警告
+				d.logger.Debug("首次读取默认路由: %s", currentExit)
 			}
 			// 更新缓存
 			d.currentExits[monitor.Name] = currentExit
@@ -621,7 +672,7 @@ func (d *FailoverDaemon) shutdown() {
 	}
 
 	// 保存最终状态
-	if err := d.stateManager.SaveState(); err != nil {
+	if err := d.stateManager.SaveState(d.currentExits); err != nil {
 		d.logger.Error("保存状态失败: %v", err)
 	}
 

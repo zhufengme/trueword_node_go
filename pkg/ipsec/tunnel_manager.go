@@ -138,8 +138,16 @@ func setupPolicyRoute(remoteIP, parentInterface, gateway string) error {
 	netlink.RouteDel(route)
 
 	// 添加新路由
-	if err := netlink.RouteAdd(route); err != nil {
-		return fmt.Errorf("添加策略路由失败: %w", err)
+	err = netlink.RouteAdd(route)
+	if err != nil {
+		// 如果失败且有网关，尝试添加 onlink 标志（支持 VPS/云服务器的跨子网网关）
+		if route.Gw != nil {
+			route.Flags = int(netlink.FLAG_ONLINK)
+			err = netlink.RouteAdd(route)
+		}
+		if err != nil {
+			return fmt.Errorf("添加策略路由失败: %w", err)
+		}
 	}
 
 	if gateway != "" {

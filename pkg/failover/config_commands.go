@@ -81,6 +81,17 @@ daemon:
   # 设为 1 表示立即切换（v1.4.1 之前的行为）
   # switch_confirmation_count: 3
 
+  # 检测模式（全局默认）
+  # 可选值: ping / dns
+  # 默认: ping
+  # 说明: 每个 monitor 可覆盖此设置
+  # check_mode: ping
+
+  # DNS 查询域名（DNS 模式使用）
+  # 默认: google.com
+  # 说明: 每个 monitor 可覆盖此设置
+  # dns_query_domain: google.com
+
   # 日志文件路径（留空则不保存日志）
   # log_file: /var/log/twnode-failover.log
   log_file: ""
@@ -93,35 +104,44 @@ daemon:
 
 monitors: []
 
-# 监控任务示例:
+# ============================================
+# 监控任务示例
+# ============================================
 #
+# 示例 1: 使用 ping 检测（传统方式）
 # - name: "monitor-cn-routes"
-#   type: "policy_group"          # 类型: policy_group 或 default_route
-#   target: "cn_routes"            # 策略组名称
-#
-#   # 检测目标IP（按顺序尝试，最多3个）
-#   check_targets:
-#     - "114.114.114.114"          # 国内DNS（首选）
-#     - "223.5.5.5"                # 阿里DNS（备选）
-#     - "119.29.29.29"             # 腾讯DNS（备选）
-#
-#   # 候选出口接口（至少2个）
+#   type: "policy_group"
+#   target: "cn_routes"
+#   check_mode: "ping"             # 使用 ICMP 检测
+#   check_targets:                 # ping 模式使用
+#     - "114.114.114.114"
+#     - "223.5.5.5"
 #   candidate_exits:
 #     - "tun_cn1"
 #     - "tun_cn2"
-#     - "eth0"
 #
-#   # 可选: 覆盖全局配置
-#   # check_interval_ms: 300
-#   # score_threshold: 10.0
-#   # switch_confirmation_count: 5  # 关键业务可设置更保守的值
-#
-# - name: "monitor-default"
+# 示例 2: 使用 DNS 检测（规避运营商限速）
+# - name: "monitor-international"
 #   type: "default_route"
-#   target: "default"              # 默认路由固定使用 "default"
+#   target: "default"
+#   check_mode: "dns"              # 使用 DNS 查询检测
+#   dns_servers:                   # DNS 服务器列表（按顺序尝试）
+#     - "1.1.1.1"
+#     - "8.8.8.8"
+#   dns_query_domain: "google.com" # 可选，覆盖全局查询域名
+#   candidate_exits:
+#     - "tun_hk"
+#     - "tun_us"
+#   check_interval_ms: 2000        # DNS 需要更长间隔
+#   switch_confirmation_count: 3
 #
+# 示例 3: 混合检测（不同任务使用不同模式）
+# - name: "monitor-backup"
+#   type: "default_route"
+#   target: "default"
+#   # 不指定 check_mode，使用全局默认 ping
 #   check_targets:
-#     - "8.8.8.8"                  # Google DNS
+#     - "8.8.8.8"
 #     - "1.1.1.1"                  # Cloudflare DNS
 #
 #   candidate_exits:
@@ -307,14 +327,48 @@ func AddMonitorInteractive() error {
 		return fmt.Errorf("无效的选择")
 	}
 
-	// 检测目标IP
-	fmt.Print("输入检测目标IP（最多3个，逗号分隔）: ")
-	targetsStr, _ := reader.ReadString('\n')
-	targetsStr = strings.TrimSpace(targetsStr)
-	checkTargets := strings.Split(targetsStr, ",")
-	for i := range checkTargets {
-		checkTargets[i] = strings.TrimSpace(checkTargets[i])
+	// 选择检测模式
+	fmt.Println()
+	fmt.Println("选择检测模式:")
+	fmt.Println("  [1] Ping 模式（ICMP 检测）")
+	fmt.Println("  [2] DNS 模式（DNS 查询检测，可规避运营商 ICMP 限速）")
+	fmt.Print("请选择 (1-2): ")
+	modeChoice, _ := reader.ReadString('\n')
+	modeChoice = strings.TrimSpace(modeChoice)
+
+	var checkMode string
+	var checkTargets []string
+	var dnsServers []string
+	var dnsQueryDomain string
+
+	if modeChoice == "1" {
+		// Ping 模式
+		checkMode = "ping"
+		fmt.Print("输入检测目标IP（最多3个，逗号分隔）: ")
+		targetsStr, _ := reader.ReadString('\n')
+		targetsStr = strings.TrimSpace(targetsStr)
+		checkTargets = strings.Split(targetsStr, ",")
+		for i := range checkTargets {
+			checkTargets[i] = strings.TrimSpace(checkTargets[i])
+		}
+	} else if modeChoice == "2" {
+		// DNS 模式
+		checkMode = "dns"
+		fmt.Print("输入 DNS 服务器列表（逗号分隔，不限数量）: ")
+		serversStr, _ := reader.ReadString('\n')
+		serversStr = strings.TrimSpace(serversStr)
+		dnsServers = strings.Split(serversStr, ",")
+		for i := range dnsServers {
+			dnsServers[i] = strings.TrimSpace(dnsServers[i])
+		}
+
+		fmt.Print("输入查询域名（默认 google.com，直接回车使用默认）: ")
+		dnsQueryDomain, _ = reader.ReadString('\n')
+		dnsQueryDomain = strings.TrimSpace(dnsQueryDomain)
+	} else {
+		return fmt.Errorf("无效的选择")
 	}
+	fmt.Println()
 
 	// 候选出口
 	fmt.Print("输入候选出口（逗号分隔）: ")
@@ -371,7 +425,10 @@ func AddMonitorInteractive() error {
 		Name:                    name,
 		Type:                    monitorType,
 		Target:                  target,
+		CheckMode:               checkMode,
 		CheckTargets:            checkTargets,
+		DNSServers:              dnsServers,
+		DNSQueryDomain:          dnsQueryDomain,
 		CandidateExits:          candidateExits,
 		CheckIntervalMs:         interval,
 		FailureThreshold:        failThreshold,
@@ -472,6 +529,23 @@ func ShowMonitor(name string) error {
 	fmt.Println()
 
 	fmt.Println("【检测配置】")
+
+	// 显示检测模式
+	checkMode := monitor.GetCheckMode(config.Daemon.CheckMode)
+	modeStr := map[string]string{
+		"ping": "Ping (ICMP)",
+		"dns":  "DNS 查询",
+	}[checkMode]
+	if modeStr == "" {
+		modeStr = checkMode
+	}
+	fmt.Printf("  检测模式: %s", modeStr)
+	if monitor.CheckMode != "" {
+		fmt.Printf(" (自定义)\n")
+	} else {
+		fmt.Printf(" (全局配置)\n")
+	}
+
 	fmt.Printf("  检测间隔: %dms", monitor.GetCheckInterval(config.Daemon.CheckIntervalMs))
 	if monitor.CheckIntervalMs > 0 {
 		fmt.Printf(" (自定义)\n")
@@ -509,12 +583,36 @@ func ShowMonitor(name string) error {
 	}
 	fmt.Println()
 
-	fmt.Println("【检测目标】")
-	for i, target := range monitor.CheckTargets {
-		if i == 0 {
-			fmt.Printf("  %d. %s (首选)\n", i+1, target)
+	// 根据检测模式显示不同的检测配置
+	if checkMode == "dns" {
+		fmt.Println("【DNS 检测配置】")
+		if len(monitor.DNSServers) > 0 {
+			fmt.Println("  DNS 服务器:")
+			for i, server := range monitor.DNSServers {
+				if i == 0 {
+					fmt.Printf("    %d. %s (首选)\n", i+1, server)
+				} else {
+					fmt.Printf("    %d. %s (备选)\n", i+1, server)
+				}
+			}
+		}
+		queryDomain := monitor.GetDNSQueryDomain(config.Daemon.DNSQueryDomain)
+		fmt.Printf("  查询域名: %s", queryDomain)
+		if monitor.DNSQueryDomain != "" {
+			fmt.Printf(" (自定义)\n")
 		} else {
-			fmt.Printf("  %d. %s (备选)\n", i+1, target)
+			fmt.Printf(" (全局配置)\n")
+		}
+	} else {
+		fmt.Println("【检测目标】")
+		if len(monitor.CheckTargets) > 0 {
+			for i, target := range monitor.CheckTargets {
+				if i == 0 {
+					fmt.Printf("  %d. %s (首选)\n", i+1, target)
+				} else {
+					fmt.Printf("  %d. %s (备选)\n", i+1, target)
+				}
+			}
 		}
 	}
 	fmt.Println()
@@ -582,6 +680,31 @@ func ShowStatus() error {
 	}
 
 	fmt.Println()
+
+	// 监控任务当前出口
+	if len(state.CurrentExits) > 0 && config != nil && len(config.Monitors) > 0 {
+		fmt.Println("【监控任务状态】")
+		for _, monitor := range config.Monitors {
+			if currentExit, exists := state.CurrentExits[monitor.Name]; exists {
+				// 获取当前出口的状态和评分
+				exitState := state.InterfaceStates[currentExit]
+				if exitState != nil && exitState.InitialCheckDone {
+					statusStr := "UP"
+					if exitState.PacketLoss >= 100.0 {
+						statusStr = "DOWN"
+					}
+					fmt.Printf("  %s: %s (%s) [延迟: %.1fms, 丢包: %.0f%%, 评分: %.1f]\n",
+						monitor.Name, currentExit, statusStr,
+						exitState.Latency, exitState.PacketLoss, exitState.FinalScore)
+				} else {
+					fmt.Printf("  %s: %s (检测中...)\n", monitor.Name, currentExit)
+				}
+			} else {
+				fmt.Printf("  %s: (未初始化)\n", monitor.Name)
+			}
+		}
+		fmt.Println()
+	}
 
 	// 最近事件
 	if len(state.RecentEvents) > 0 {

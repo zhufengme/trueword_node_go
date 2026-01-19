@@ -37,7 +37,8 @@ type FailoverEvent struct {
 type RuntimeState struct {
 	StartTime       time.Time                  `json:"start_time"`
 	InterfaceStates map[string]*InterfaceState `json:"interface_states"`
-	RecentEvents    []FailoverEvent            `json:"recent_events"` // 最近20条
+	RecentEvents    []FailoverEvent            `json:"recent_events"`  // 最近20条
+	CurrentExits    map[string]string          `json:"current_exits"`  // monitor_name -> current_exit
 }
 
 // StateManager 状态管理器
@@ -196,7 +197,7 @@ func (sm *StateManager) GetRecentEvents(count int) []FailoverEvent {
 }
 
 // SaveState 保存状态到文件
-func (sm *StateManager) SaveState() error {
+func (sm *StateManager) SaveState(currentExits map[string]string) error {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
 
@@ -204,6 +205,7 @@ func (sm *StateManager) SaveState() error {
 		StartTime:       sm.startTime,
 		InterfaceStates: sm.states,
 		RecentEvents:    sm.events,
+		CurrentExits:    currentExits,
 	}
 
 	data, err := json.MarshalIndent(runtimeState, "", "  ")

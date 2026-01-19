@@ -109,19 +109,25 @@ func addTestPolicyRoute(targetIP, exitInterface string) error {
 		}
 	}
 
-	// 添加路由
+	// 添加路由（支持 onlink 容错）
 	var routeCmd *exec.Cmd
 	if isPhysical && gateway != "" {
 		// 物理接口：通过网关路由
-		// ip route add <targetIP> via <gateway> dev <interface> table <tableID>
+		// 第一次尝试：正常路由
 		routeCmd = exec.Command("ip", "route", "add", targetIP, "via", gateway, "dev", exitInterface, "table", strconv.Itoa(tableID))
+		err = routeCmd.Run()
+		if err != nil {
+			// 第二次尝试：添加 onlink 标志（支持 VPS/云服务器跨子网网关）
+			routeCmd = exec.Command("ip", "route", "add", targetIP, "via", gateway, "dev", exitInterface, "table", strconv.Itoa(tableID), "onlink")
+			err = routeCmd.Run()
+		}
 	} else {
 		// 隧道或无网关的P2P连接：直接通过设备路由
-		// ip route add <targetIP> dev <exitInterface> table <tableID>
 		routeCmd = exec.Command("ip", "route", "add", targetIP, "dev", exitInterface, "table", strconv.Itoa(tableID))
+		err = routeCmd.Run()
 	}
 
-	if err := routeCmd.Run(); err != nil {
+	if err != nil {
 		// 清理规则
 		exec.Command("ip", "rule", "del", "pref", strconv.Itoa(TestPolicyPriority)).Run()
 		return fmt.Errorf("添加测试路由失败: %w", err)
